@@ -1,248 +1,146 @@
-import FinanceDataReader as fdr
-import pandas as pd
-import numpy as np
-import requests
 import os
 import time
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+import requests
+import pandas as pd
+import numpy as np
+import FinanceDataReader as fdr
 from flask import Flask
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Bbongsil Star-Rated Stock Bot (NXT Extended) is running!"
-
+# 환경 변수에서 텔레그램 토큰 및 채팅 ID 로드
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"})
-    except Exception as e:
-        print(f"발송 실패: {e}")
-
-# 상태 관리 변수
+# 오늘 이미 알림을 보낸 종목 중복 방지 저장소
 sent_signals_today = set()
-today_signals_history = []  # 마감 브리핑용 당일 포착 종목 기록
-sent_open_notice = False
-sent_close_notice = False
-last_checked_date = ""
+last_reset_date = None
+
+def send_telegram_msg(message):
+    """텔레그램 메시지 전송 함수"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[경고] TELEGRAM_TOKEN 또는 CHAT_ID가 설정되지 않았습니다.")
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"텔레그램 전송 오류: {e}")
+
+def get_kst_now():
+    """한국 표준시(KST) 현재 시간 반환"""
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst)
+
+def calculate_rsi(data, window=14):
+    """RSI 지표 계산"""
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def scan_stocks():
+    """시가총액 상위 종목 스캔 및 시그널 추출"""
+    global sent_signals_today, last_reset_date
+    
+    now_kst = get_kst_now()
+    today_str = now_kst.strftime("%Y-%m-%d")
+    
+    # 일자가 바뀌면 중복 방지 리스트 초기화
+    if last_reset_date != today_str:
+        sent_signals_today.clear()
+        last_reset_date = today_str
+
+    try:
+        # KOSPI / KOSDAQ 상위 종목 스캔 (예시)
+        krx = fdr.StockListing('KRX')
+        top_stocks = krx.sort_values(by='Marcap', ascending=False).head(100)
+        
+        for idx, row in top_stocks.iterrows():
+            code = row['Code']
+            name = row['Name']
+            
+            # 당일 이미 알림이 나간 종목은 건너뜀
+            if code in sent_signals_today:
+                continue
+                
+            df = fdr.DataReader(code, now_kst - timedelta(days=60), now_kst)
+            if len(df) < 20:
+                continue
+                
+            df['RSI'] = calculate_rsi(df)
+            df['MA20'] = df['Close'].rolling(20).mean()
+            df['Disparity'] = (df['Close'] / df['MA20']) * 100
+            
+            current_price = int(df['Close'].iloc[-1])
+            rsi_val = df['RSI'].iloc[-1]
+            disparity_val = df['Disparity'].iloc[-1]
+            
+            signal_type = None
+            stars = ""
+            
+            # 시그널 조건 판정
+            if rsi_val <= 30 and disparity_val <= 95:
+                signal_type = "F+"
+                stars = "⭐⭐⭐"
+            elif rsi_val <= 33 and disparity_val <= 97:
+                signal_type = "Q"
+                stars = "⭐⭐"
+            elif rsi_val <= 35:
+                signal_type = "W+"
+                stars = "⭐"
+                
+            if signal_type:
+                # 포착시점 생성 (년-월-일 시:분:초)
+                capture_time = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                
+                target_price = int(current_price * 1.05)  # 목표가 +5%
+                stop_loss = int(current_price * 0.97)     # 손절가 -3%
+                
+                msg = (
+                    f"🚨 <b>[뽕실로봇] {signal_type} 시그널 포착!</b> {stars}\n\n"
+                    f"⏰ <b>포착시점:</b> {capture_time}\n"
+                    f"📌 <b>종목명:</b> {name} ({code})\n"
+                    f"💰 <b>현재가/추천가:</b> {current_price:,}원\n"
+                    f"🎯 <b>목표가:</b> {target_price:,}원 (+5%)\n"
+                    f"🛑 <b>손절가:</b> {stop_loss:,}원 (-3%)\n\n"
+                    f"📊 <b>지표:</b> RSI {rsi_val:.1f} / 이격도 {disparity_val:.1f}%\n"
+                    f"💡 <i>진입 전 악재 공시/뉴스 유무를 가볍게 확인하세요.</i>"
+                )
+                
+                send_telegram_msg(msg)
+                sent_signals_today.add(code)
+                time.sleep(1) # 전송 간격 조절
+                
+    except Exception as e:
+        print(f"스캔 중 오류 발생: {e}")
 
 def run_scanner():
-    global sent_signals_today, today_signals_history, sent_open_notice, sent_close_notice, last_checked_date
-    
+    """ 주기적으로 스캔 루프 실행 """
     while True:
-        kst = timezone(timedelta(hours=9))
-        now = datetime.now(kst)
-        today_date_str = now.strftime('%Y-%m-%d')
-        
-        # 자정 기준 당일 알림 및 상태 기록 초기화
-        if today_date_str != last_checked_date:
-            sent_signals_today.clear()
-            today_signals_history.clear()
-            sent_open_notice = False
-            sent_close_notice = False
-            last_checked_date = today_date_str
-            print(f"🗓️ 날짜 변경 ({today_date_str}): 발송 및 안내 상태 리셋")
+        now = get_kst_now()
+        # 장 운영 시간 및 감시 시간대 (08:00 ~ 20:00)
+        if 8 <= now.hour < 20 and now.weekday() < 5:
+            scan_stocks()
+        time.sleep(60) # 1분 마다 스캔
 
-        # 주말(토/일) 대기
-        if now.weekday() > 4:
-            time.sleep(300)
-            continue
-        
-        current_time_str = now.strftime('%H:%M')
-        current_time_num = int(now.strftime('%H%M'))
-        
-        # ==========================================
-        # 🔔 1) 장 시작 및 NXT 마감 브리핑 체크
-        # ==========================================
-        
-        # 장 시작 알림 (07:50 ~ 08:05 사이 1회 발송)
-        if 750 <= current_time_num <= 805 and not sent_open_notice:
-            open_msg = (
-                f"🔔 <b>[뽕실로봇 - NXT/정규장 시작 알림]</b> 🔔\n\n"
-                f"📅 <b>일자</b>: {today_date_str}\n"
-                f"🚀 정규장 및 NXT 거래 스캔을 시작합니다! (08:00 ~ 20:00)\n"
-                f"📊 <b>시가총액 상위 100개 정예 종목</b> 실시간 포착 가동 중.\n\n"
-                f"💡 오늘 하루도 성공 투자하시길 바랍니다!"
-            )
-            send_telegram(open_msg)
-            sent_open_notice = True
-            print(f"[{current_time_str}] 장 시작 알림 발송 완료")
-
-        # 장/NXT 마감 브리핑 알림 (20:00 ~ 20:10 사이 1회 발송)
-        if 2000 <= current_time_num <= 2010 and not sent_close_notice:
-            if today_signals_history:
-                brief_list = []
-                for idx, s in enumerate(today_signals_history, 1):
-                    item_str = (
-                        f"{idx}. <b>{s['name']}</b> ({s['symbol']}) | {s['star']}\n"
-                        f"   └ 종류: {s['signal_type']}\n"
-                        f"   └ 🎯 매수: {s['buy_min']:,}~{s['buy_max']:,}원 | 목표: {s['target']:,}원 | 손절: {s['stop']:,}원"
-                    )
-                    brief_list.append(item_str)
-                briefing_details = "\n\n".join(brief_list)
-            else:
-                briefing_details = "오늘 포착 조건에 부합한 종목이 없었습니다."
-
-            close_msg = (
-                f"📊 <b>[뽕실로봇 - 마감 종합 브리핑 리포트]</b> 📊\n\n"
-                f"📅 <b>일자</b>: {today_date_str}\n"
-                f"👏 금일 정규장 및 NXT 연장 거래가 모두 마감되었습니다.\n\n"
-                f"📌 <b>오늘의 총 포착 시그널</b>: <b>{len(today_signals_history)}건</b>\n"
-                f"----------------------------------------\n"
-                f"{briefing_details}\n"
-                f"----------------------------------------\n\n"
-                f"오늘 하루도 수고 많으셨습니다. 편안한 저녁 되세요! 😴"
-            )
-            send_telegram(close_msg)
-            sent_close_notice = True
-            print(f"[{current_time_str}] 마감 브리핑 리포트 발송 완료")
-
-        # 스캔 운영 시간 (08:00 ~ 20:00) 외에는 대기
-        if current_time_num < 800 or current_time_num > 2000:
-            time.sleep(120)
-            continue
-
-        print(f"🔍 [{current_time_str}] 상위 100개 종목 별점 시그널 스캔 중...")
-
-        # ==========================================
-        # 📊 2) 실시간 종목 시그널 스캔
-        # ==========================================
-        try:
-            df_krx = fdr.StockListing('KRX')
-            target_stocks = df_krx.head(100)  # 상위 100개 우량주 감시
-
-            count = 0
-            for index, row in target_stocks.iterrows():
-                symbol = row['Code'] if 'Code' in row else row['Symbol']
-                name = row['Name']
-                
-                if symbol in sent_signals_today:
-                    continue
-                
-                try:
-                    df = fdr.DataReader(symbol)
-                    if len(df) < 30: continue
-                        
-                    today = df.iloc[-1]
-                    today_price = int(today['Close'])
-                    
-                    prev_close = df.iloc[-2]['Close']
-                    change_rate = ((today_price - prev_close) / prev_close) * 100
-                    
-                    ma20 = df['Close'].rolling(20).mean().iloc[-1]
-                    disparity_20 = (today_price / ma20) * 100
-                    
-                    std20 = df['Close'].rolling(20).std().iloc[-1]
-                    lower_band = ma20 - (2 * std20)
-                    
-                    delta = df['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                    rs = gain / loss
-                    rsi = (100 - (100 / (1 + rs))).iloc[-1]
-                    
-                    today_vol = today['Volume']
-                    prev_vol = df.iloc[-2]['Volume']
-                    vol_ratio = (today_vol / prev_vol * 100) if prev_vol > 0 else 0
-
-                    signal_type, guide, star_rating = None, "", ""
-                    buy_min, buy_max = 0, 0
-                    target_price, stop_loss = 0, 0
-                    sell_timing = ""
-
-                    # --- 신호 세부 조건 및 별점(수익확률) 판정 ---
-                    
-                    # 1) F+ (과대낙폭 바닥)
-                    if rsi <= 30.0 and disparity_20 <= 92.0:
-                        signal_type = "F+ (과대낙폭 바닥)"
-                        guide = "💎 낙폭과대 과매도 구간! 반등 확률 높은 타점"
-                        buy_max = today_price
-                        buy_min = int(today_price * 0.985)
-                        target_price = int(today_price * 1.03)
-                        stop_loss = int(today_price * 0.98)
-                        sell_timing = "⏳ 매수 후 1~3일 이내 반등 시 (+3% 이상 익절)"
-                        
-                        if rsi <= 25.0 or disparity_20 <= 89.0:
-                            star_rating = "⭐⭐⭐ (높음)"
-                        else:
-                            star_rating = "⭐⭐ (보통)"
-
-                    # 2) W+ (수급 주도주 돌파)
-                    elif vol_ratio >= 250.0 and (3.0 <= change_rate <= 10.0) and (50.0 <= rsi <= 68.0):
-                        signal_type = "W+ (수급 주도주 돌파)"
-                        guide = "🔥 강한 수급 유입! 주도주 눌림/돌파 대응"
-                        buy_max = today_price
-                        buy_min = int(today_price * 0.99)
-                        target_price = int(today_price * 1.04)
-                        stop_loss = int(today_price * 0.975)
-                        sell_timing = "⏳ 매수 후 1~2일 이내 (+4% 달성 시 분할 익절)"
-                        
-                        if vol_ratio >= 350.0:
-                            star_rating = "⭐⭐⭐ (높음)"
-                        else:
-                            star_rating = "⭐⭐ (보통)"
-
-                    # 3) Q (단타 눌림목)
-                    elif rsi <= 35.0 and change_rate <= -2.5:
-                        signal_type = "Q (단타 눌림목)"
-                        guide = "⚡ 당일 과매도 단타 타점! 빠른 반등 대응"
-                        buy_max = today_price
-                        buy_min = int(today_price * 0.99)
-                        target_price = int(today_price * 1.025)
-                        stop_loss = int(today_price * 0.982)
-                        sell_timing = "⏳ 당일 장마감 전 또는 이튿날 오전 중 빠르게 매도"
-                        
-                        if rsi <= 30.0:
-                            star_rating = "⭐⭐ (보통)"
-                        else:
-                            star_rating = "⭐ (약함)"
-
-                    if signal_type:
-                        count += 1
-                        sent_signals_today.add(symbol)
-                        
-                        today_signals_history.append({
-                            'name': name,
-                            'symbol': symbol,
-                            'signal_type': signal_type,
-                            'star': star_rating,
-                            'buy_min': buy_min,
-                            'buy_max': buy_max,
-                            'target': target_price,
-                            'stop': stop_loss
-                        })
-                        
-                        msg = (
-                            f"🚨 <b>[뽕실로봇 - {signal_type}]</b> 🚨\n\n"
-                            f"1️⃣ <b>종목정보</b>: <b>{name}</b> ({symbol})\n"
-                            f"2️⃣ <b>수익확률/신뢰도</b>: <b>{star_rating}</b>\n"
-                            f"3️⃣ <b>현재가/등락률</b>: {today_price:,}원 ({change_rate:+.2f}%)\n"
-                            f"4️⃣ <b>🎯 추천 매수단가</b>: <code>{buy_min:,}원 ~ {buy_max:,}원</code>\n"
-                            f"5️⃣ <b>🎯 목표 매도단가 (익절)</b>: <code>{target_price:,}원</code>\n"
-                            f"6️⃣ <b>🛑 손절 매도단가 (손절)</b>: <code>{stop_loss:,}원</code>\n"
-                            f"7️⃣ <b>⏱️ 추천 매도시기</b>: {sell_timing}\n"
-                            f"8️⃣ <b>보조지표</b>: RSI({rsi:.1f}) | 20일이격도({disparity_20:.1f}%) | 거래량비율({vol_ratio:.0f}%)\n\n"
-                            f"💡 <b>대응 가이드</b>: {guide}"
-                        )
-                        send_telegram(msg)
-                except:
-                    continue
-            if count > 0:
-                print(f"✨ 뽕실로봇 별점 시그널 {count}개 발송 완료.")
-        except Exception as e:
-            print(f"스캔 오류: {e}")
-
-        # 60초 간격 스캔
-        time.sleep(60)
+@app.route('/')
+def health_check():
+    return "뽕실로봇 정상 작동 중입니다.", 200
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_scanner)
     t.daemon = True
     t.start()
     
-    app.run(host='0.0.0.0', port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
