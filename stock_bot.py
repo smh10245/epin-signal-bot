@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Epin High-Winrate Bot with Market Open/Close Notice is running!"
+    return "Bbongsil High-Winrate Stock Bot (NXT Extended) is running!"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -24,14 +24,15 @@ def send_telegram(text):
     except Exception as e:
         print(f"발송 실패: {e}")
 
-# 당일 중복 발송 방지 및 상태 관리 변수
+# 상태 관리 변수
 sent_signals_today = set()
+today_signals_history = []  # 마감 브리핑용 당일 포착 종목 기록
 sent_open_notice = False
 sent_close_notice = False
 last_checked_date = ""
 
 def run_scanner():
-    global sent_signals_today, sent_open_notice, sent_close_notice, last_checked_date
+    global sent_signals_today, today_signals_history, sent_open_notice, sent_close_notice, last_checked_date
     
     while True:
         kst = timezone(timedelta(hours=9))
@@ -41,6 +42,7 @@ def run_scanner():
         # 자정 기준 당일 알림 및 상태 기록 초기화
         if today_date_str != last_checked_date:
             sent_signals_today.clear()
+            today_signals_history.clear()
             sent_open_notice = False
             sent_close_notice = False
             last_checked_date = today_date_str
@@ -55,40 +57,57 @@ def run_scanner():
         current_time_num = int(now.strftime('%H%M'))
         
         # ==========================================
-        # 🔔 1) 장 시작 / 장 마감 알림 체크
+        # 🔔 1) 장 시작 및 NXT 마감 브리핑 체크
         # ==========================================
         
-        # 장 시작 알림 (08:50 ~ 09:02 사이 1회 발송)
-        if 850 <= current_time_num <= 902 and not sent_open_notice:
+        # 장 시작 알림 (07:50 ~ 08:05 사이 1회 발송)
+        if 750 <= current_time_num <= 805 and not sent_open_notice:
             open_msg = (
-                f"🔔 <b>[이핀로봇 - 장 시작 알림]</b> 🔔\n\n"
+                f"🔔 <b>[뽕실로봇 - NXT/정규장 시작 알림]</b> 🔔\n\n"
                 f"📅 <b>일자</b>: {today_date_str}\n"
-                f"🚀 국내 증시 장이 곧 시작/개장합니다!\n"
-                f"📊 <b>시가총액 상위 100개 정예 종목</b> 실시간 스캔을 시작합니다.\n\n"
-                f"💡 오늘 하루도 성투하시길 바랍니다!"
+                f"🚀 정규장 및 NXT 거래 스캔을 시작합니다! (08:00 ~ 20:00)\n"
+                f"📊 <b>시가총액 상위 100개 정예 종목</b> 실시간 포착 가동 중.\n\n"
+                f"💡 오늘 하루도 성공 투자하시길 바랍니다!"
             )
             send_telegram(open_msg)
             sent_open_notice = True
             print(f"[{current_time_str}] 장 시작 알림 발송 완료")
 
-        # 장 마감 알림 (15:30 ~ 15:40 사이 1회 발송)
-        if 1530 <= current_time_num <= 1540 and not sent_close_notice:
+        # 장/NXT 마감 브리핑 알림 (20:00 ~ 20:10 사이 1회 발송)
+        if 2000 <= current_time_num <= 2010 and not sent_close_notice:
+            # 브리핑 요약문 작성
+            if today_signals_history:
+                brief_list = []
+                for idx, s in enumerate(today_signals_history, 1):
+                    item_str = (
+                        f"{idx}. <b>{s['name']}</b> ({s['symbol']}) - {s['signal_type']}\n"
+                        f"   └ 🎯 매수: {s['buy_min']:,}~{s['buy_max']:,}원 | 목표: {s['target']:,}원 | 손절: {s['stop']:,}원"
+                    )
+                    brief_list.append(item_str)
+                briefing_details = "\n\n".join(brief_list)
+            else:
+                briefing_details = "오늘 엄격한 포착 조건에 부합한 종목이 없었습니다."
+
             close_msg = (
-                f"🔔 <b>[이핀로봇 - 장 마감 알림]</b> 🔔\n\n"
+                f"📊 <b>[뽕실로봇 - 마감 종합 브리핑 리포트]</b> 📊\n\n"
                 f"📅 <b>일자</b>: {today_date_str}\n"
-                f"👏 금일 국내 증시 장이 마감되었습니다.\n"
-                f"오늘 하루도 수고 많으셨습니다. 편안한 저녁 되세요!"
+                f"👏 금일 정규장 및 NXT 연장 거래가 모두 마감되었습니다.\n\n"
+                f"📌 <b>오늘의 총 포착 시그널</b>: <b>{len(today_signals_history)}건</b>\n"
+                f"----------------------------------------\n"
+                f"{briefing_details}\n"
+                f"----------------------------------------\n\n"
+                f"오늘 하루도 수고 많으셨습니다. 편안한 저녁 되세요! 😴"
             )
             send_telegram(close_msg)
             sent_close_notice = True
-            print(f"[{current_time_str}] 장 마감 알림 발송 완료")
+            print(f"[{current_time_str}] 마감 브리핑 리포트 발송 완료")
 
-        # 평일 장중 시간(08:50 ~ 15:35) 외에는 대기
-        if current_time_num < 850 or current_time_num > 1535:
+        # 스캔 운영 시간 (08:00 ~ 20:00) 외에는 대기
+        if current_time_num < 800 or current_time_num > 2000:
             time.sleep(120)
             continue
 
-        print(f"🔍 [{current_time_str}] 상위 100개 종목 밸런스 시그널 스캔 중...")
+        print(f"🔍 [{current_time_str}] 상위 100개 종목 NXT 연장 스캔 중...")
 
         # ==========================================
         # 📊 2) 실시간 종목 시그널 스캔
@@ -120,7 +139,7 @@ def run_scanner():
                     ma20 = df['Close'].rolling(20).mean().iloc[-1]
                     disparity_20 = (today_price / ma20) * 100
                     
-                    # 볼린저밴드 하단 (20일, 2표준편차)
+                    # 볼린저밴드 하단
                     std20 = df['Close'].rolling(20).std().iloc[-1]
                     lower_band = ma20 - (2 * std20)
                     
@@ -131,7 +150,7 @@ def run_scanner():
                     rs = gain / loss
                     rsi = (100 - (100 / (1 + rs))).iloc[-1]
                     
-                    # 거래량 비율 (전일 대비 %)
+                    # 거래량 비율
                     today_vol = today['Volume']
                     prev_vol = df.iloc[-2]['Volume']
                     vol_ratio = (today_vol / prev_vol * 100) if prev_vol > 0 else 0
@@ -141,7 +160,7 @@ def run_scanner():
                     target_price, stop_loss = 0, 0
                     sell_timing = ""
 
-                    # --- 적정 밸런스 조건 ---
+                    # --- 뽕실로봇 밸런스 조건 ---
                     # 1) F+ (과대낙폭 바닥 반등)
                     if rsi <= 30.0 and disparity_20 <= 92.0:
                         signal_type = "F+ (과대낙폭 바닥)"
@@ -179,8 +198,19 @@ def run_scanner():
                         count += 1
                         sent_signals_today.add(symbol)
                         
+                        # 마감 브리핑용 기록 저장
+                        today_signals_history.append({
+                            'name': name,
+                            'symbol': symbol,
+                            'signal_type': signal_type,
+                            'buy_min': buy_min,
+                            'buy_max': buy_max,
+                            'target': target_price,
+                            'stop': stop_loss
+                        })
+                        
                         msg = (
-                            f"🚨 <b>[이핀로봇 - {signal_type}]</b> 🚨\n\n"
+                            f"🚨 <b>[뽕실로봇 - {signal_type}]</b> 🚨\n\n"
                             f"1️⃣ <b>종목정보</b>: <b>{name}</b> ({symbol})\n"
                             f"2️⃣ <b>현재가/등락률</b>: {today_price:,}원 ({change_rate:+.2f}%)\n"
                             f"3️⃣ <b>🎯 추천 매수단가</b>: <code>{buy_min:,}원 ~ {buy_max:,}원</code>\n"
@@ -194,7 +224,7 @@ def run_scanner():
                 except:
                     continue
             if count > 0:
-                print(f"✨ 밸런스 시그널 {count}개 발송 완료.")
+                print(f"✨ 뽕실로봇 시그널 {count}개 발송 완료.")
         except Exception as e:
             print(f"스캔 오류: {e}")
 
