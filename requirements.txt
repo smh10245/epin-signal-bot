@@ -1,4 +1,5 @@
-finance-datareader
+FinanceDataReader
 pandas
 numpy
 requests
+Flask
