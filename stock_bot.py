@@ -142,7 +142,7 @@ def check_sidecar():
         print(f"사이드카 체크 중 오류: {e}")
 
 def send_daily_closing_report():
-    """오후 8시 장 마감 종합 브리핑 리포트 전송"""
+    """장 마감 종합 브리핑 리포트 전송"""
     global sent_signals_today
     now_kst = get_kst_now()
     date_str = now_kst.strftime("%Y-%m-%d")
@@ -246,17 +246,18 @@ def run_scanner():
         now = get_kst_now()
         today_str = now.strftime("%Y-%m-%d")
         
-        # 평일 08:00 ~ 19:59 사이에는 개별 종목 스캔
-        if 8 <= now.hour < 20 and now.weekday() < 5:
-            scan_stocks()
-            
-        # 정확히 저녁 8시(20시) 정각에 평일 마감 브리핑 1회 전송
-        if now.hour == 20 and now.weekday() < 5:
-            if daily_summary_sent_date != today_str:
-                send_daily_closing_report()
-                daily_summary_sent_date = today_str
+        if now.weekday() < 5:  # 평일일 경우에만 작동
+            # 평일 08:00 ~ 15:29 사이에는 개별 종목 스캔 (장 운영 시간)
+            if (8 <= now.hour < 15) or (now.hour == 15 and now.minute < 30):
+                scan_stocks()
                 
-        time.sleep(60)
+            # 정확히 15시 30분(장 마감) 이후에 평일 마감 브리핑 1회 전송
+            if now.hour == 15 and now.minute >= 30:
+                if daily_summary_sent_date != today_str:
+                    send_daily_closing_report()
+                    daily_summary_sent_date = today_str
+                
+        time.sleep(15)  # 오차를 줄이기 위해 15초 단위로 체크
 
 @app.route('/')
 def health_check():
