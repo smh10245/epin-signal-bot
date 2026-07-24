@@ -16,6 +16,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 sent_signals_today = set()
 sidecar_alerts_today = set()
 last_reset_date = None
+daily_summary_sent_date = None
 
 def send_telegram_msg(message):
     """텔레그램 메시지 전송"""
@@ -53,14 +54,12 @@ def check_sidecar():
     capture_time = now_kst.strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        # KOSPI 200 지수 / 대표 선물 지수 모니터링
         df_kospi = fdr.DataReader('KS11', now_kst - timedelta(days=5), now_kst)
         if len(df_kospi) >= 2:
             prev_close = df_kospi['Close'].iloc[-2]
             curr_price = df_kospi['Close'].iloc[-1]
             change_rate = ((curr_price - prev_close) / prev_close) * 100
 
-            # KOSPI 매도 사이드카 조건 (약 -5% 이상 급락 시)
             if change_rate <= -5.0 and "KOSPI_SELL" not in sidecar_alerts_today:
                 msg = (
                     f"🚨 <b>[시장 속보] KOSPI 매도 사이드카 발동!</b>\n\n"
@@ -71,7 +70,6 @@ def check_sidecar():
                 send_telegram_msg(msg)
                 sidecar_alerts_today.add("KOSPI_SELL")
 
-            # KOSPI 매수 사이드카 조건 (약 +5% 이상 급등 시)
             elif change_rate >= 5.0 and "KOSPI_BUY" not in sidecar_alerts_today:
                 msg = (
                     f"🚀 <b>[시장 속보] KOSPI 매수 사이드카 발동!</b>\n\n"
@@ -82,14 +80,12 @@ def check_sidecar():
                 send_telegram_msg(msg)
                 sidecar_alerts_today.add("KOSPI_BUY")
 
-        # KOSDAQ 지수 모니터링
         df_kosdaq = fdr.DataReader('KQ11', now_kst - timedelta(days=5), now_kst)
         if len(df_kosdaq) >= 2:
             prev_close_kq = df_kosdaq['Close'].iloc[-2]
             curr_price_kq = df_kosdaq['Close'].iloc[-1]
             change_rate_kq = ((curr_price_kq - prev_close_kq) / prev_close_kq) * 100
 
-            # KOSDAQ 매도 사이드카 조건 (약 -6% 이상 급락 시)
             if change_rate_kq <= -6.0 and "KOSDAQ_SELL" not in sidecar_alerts_today:
                 msg = (
                     f"🚨 <b>[시장 속보] KOSDAQ 매도 사이드카 발동!</b>\n\n"
@@ -100,7 +96,6 @@ def check_sidecar():
                 send_telegram_msg(msg)
                 sidecar_alerts_today.add("KOSDAQ_SELL")
 
-            # KOSDAQ 매수 사이드카 조건 (약 +6% 이상 급등 시)
             elif change_rate_kq >= 6.0 and "KOSDAQ_BUY" not in sidecar_alerts_today:
                 msg = (
                     f"🚀 <b>[시장 속보] KOSDAQ 매수 사이드카 발동!</b>\n\n"
@@ -114,6 +109,27 @@ def check_sidecar():
     except Exception as e:
         print(f"사이드카 체크 중 오류: {e}")
 
+def send_daily_closing_report():
+    """오후 8시 장 마감 종합 브리핑 리포트 전송"""
+    global sent_signals_today
+    now_kst = get_kst_now()
+    date_str = now_kst.strftime("%Y-%m-%d")
+    
+    if not sent_signals_today:
+        msg = (
+            f"📋 <b>[뽕실로봇] {date_str} 장 마감 종합 브리핑</b>\n\n"
+            f"오늘 장 운영 시간 동안 포착된 시그널 종목이 없습니다."
+        )
+    else:
+        stocks_list = "\n".join([f"• {item}" for item in sent_signals_today])
+        msg = (
+            f"📋 <b>[뽕실로봇] {date_str} 장 마감 종합 브리핑</b>\n\n"
+            f"오늘 총 <b>{len(sent_signals_today)}개</b>의 종목 시그널이 포착되었습니다!\n\n"
+            f"<b>[포착된 종목 리스트]</b>\n{stocks_list}\n\n"
+            f"💡 <i>내일 장에서 성공적인 투자 되시길 바랍니다!</i>"
+        )
+    send_telegram_msg(msg)
+
 def scan_stocks():
     """개별 종목 시그널 스캔"""
     global sent_signals_today, last_reset_date, sidecar_alerts_today
@@ -126,7 +142,6 @@ def scan_stocks():
         sidecar_alerts_today.clear()
         last_reset_date = today_str
 
-    # 시장 사이드카 발동 여부 우선 점검
     check_sidecar()
 
     try:
@@ -182,22 +197,33 @@ def scan_stocks():
                 )
                 
                 send_telegram_msg(msg)
-                sent_signals_today.add(code)
+                sent_signals_today.add(f"{name} ({code}) - {signal_type}")
                 time.sleep(1)
                 
     except Exception as e:
         print(f"스캔 중 오류 발생: {e}")
 
 def run_scanner():
+    global daily_summary_sent_date
     while True:
         now = get_kst_now()
+        today_str = now.strftime("%Y-%m-%d")
+        
+        # 평일 08:00 ~ 19:59 사이에는 개별 종목 스캔
         if 8 <= now.hour < 20 and now.weekday() < 5:
             scan_stocks()
+            
+        # 정확히 저녁 8시(20시) 정각에 평일 마감 브리핑 1회 전송
+        if now.hour == 20 and now.weekday() < 5:
+            if daily_summary_sent_date != today_str:
+                send_daily_closing_report()
+                daily_summary_sent_date = today_str
+                
         time.sleep(60)
 
 @app.route('/')
 def health_check():
-    return "뽕실로봇 및 사이드카 감지기 정상 작동 중입니다.", 200
+    return "뽕실로봇 마감 브리핑 및 스캐너 정상 작동 중입니다.", 200
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_scanner)
