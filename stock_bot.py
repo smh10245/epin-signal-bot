@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 import numpy as np
 import FinanceDataReader as fdr
+import yfinance as yf
 from flask import Flask
 
 app = Flask(__name__)
@@ -17,6 +18,7 @@ sent_signals_today = set()
 sidecar_alerts_today = set()
 last_reset_date = None
 daily_summary_sent_date = None
+morning_briefing_sent_date = None  # 모닝 브리핑 중복 방지용 변수 추가
 
 def send_telegram_msg(message):
     """텔레그램 메시지 전송"""
@@ -67,8 +69,7 @@ def calculate_proper_price(row, current_price):
             return int(bps * 1.2)
             
     except Exception as e:
-        print(f"적정주가 계산 예외: {e}")
-        
+        pass
     return int(current_price * 1.12)
 
 def check_investor_buying(code):
@@ -78,32 +79,24 @@ def check_investor_buying(code):
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers)
         
-        # 네이버 금융에서 순매매량 표 추출
         dfs = pd.read_html(res.text, encoding='euc-kr', match='순매매량')
         if not dfs:
             return True
             
         df = dfs[0]
-        # 표 구조(MultiIndex) 평탄화
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(0)
             
-        # 최근 3일치 데이터만 추출
         df = df.dropna(subset=['날짜']).head(3)
-        
         inst_col = [c for c in df.columns if '기관' in c][0]
         fore_col = [c for c in df.columns if '외국인' in c][0]
         
-        # 문자열(콤마, 부호 등)을 숫자로 변환 후 합산
         inst_sum = df[inst_col].astype(str).str.replace(r'[^0-9\-]', '', regex=True).replace('', '0').astype(int).sum()
         fore_sum = df[fore_col].astype(str).str.replace(r'[^0-9\-]', '', regex=True).replace('', '0').astype(int).sum()
         
-        # 기관이나 외국인 중 한 곳이라도 3일 누적 순매수(+)라면 True
         return inst_sum > 0 or fore_sum > 0
-        
     except Exception as e:
-        print(f"{code} 수급 확인 중 오류: {e}")
-        return True # 크롤링 오류 시 봇 멈춤 방지를 위해 일단 통과
+        return True 
 
 def check_sidecar():
     """KOSPI / KOSDAQ 선물 등락률 감시"""
@@ -123,6 +116,73 @@ def check_sidecar():
                 sidecar_alerts_today.add("KOSPI_BUY")
     except Exception as e:
         pass
+
+def send_morning_briefing():
+    """장 시작 전 미국 증시 요약 및 섹터 전망 브리핑 (07:30 전송)"""
+    now_kst = get_kst_now()
+    date_str = now_kst.strftime("%Y-%m-%d")
+    
+    tickers = {
+        '나스닥 종합지수': '^IXIC',
+        '필라델피아 반도체': '^SOX',
+        '엔비디아 (반도체)': 'NVDA',
+        '테슬라 (2차전지)': 'TSLA',
+        '애플 (IT/모바일)': 'AAPL'
+    }
+    
+    results = {}
+    for name, ticker in tickers.items():
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if len(hist) >= 2:
+                prev = hist['Close'].iloc[-2]
+                curr = hist['Close'].iloc[-1]
+                change = ((curr - prev) / prev) * 100
+                results[name] = change
+            else:
+                results[name] = 0.0
+        except Exception:
+            results[name] = 0.0
+            
+    # 브리핑 메시지 조합
+    msg = f"🌅 <b>[뽕실로봇] {date_str} 장전 모닝 브리핑</b>\n\n"
+    msg += "🇺🇸 <b>[밤사이 미국 증시 마감]</b>\n"
+    
+    for name, chg in results.items():
+        icon = "🔴" if chg < 0 else "🟢"
+        sign = "+" if chg > 0 else ""
+        msg += f"{icon} {name}: {sign}{chg:.2f}%\n"
+        
+    msg += "\n💡 <b>[오늘의 장초반 국내 섹터 전망]</b>\n"
+    
+    # 1. 반도체 섹터 전망 로직
+    nvda_chg = results.get('엔비디아 (반도체)', 0)
+    if nvda_chg >= 1.5:
+        msg += "📈 <b>반도체 (상승 예상)</b>: 삼성전자, SK하이닉스, 한미반도체\n"
+    elif nvda_chg <= -1.5:
+        msg += "📉 <b>반도체 (하락 유의)</b>: 삼성전자, SK하이닉스, 한미반도체\n"
+    else:
+        msg += "➖ <b>반도체 (보합 예상)</b>: 미국 반도체 변동폭 미미, 개별 장세 예상\n"
+        
+    # 2. 2차전지 섹터 전망 로직
+    tsla_chg = results.get('테슬라 (2차전지)', 0)
+    if tsla_chg >= 1.5:
+        msg += "📈 <b>2차전지 (상승 예상)</b>: 에코프로, LG에너지솔루션, 포스코퓨처엠\n"
+    elif tsla_chg <= -1.5:
+        msg += "📉 <b>2차전지 (하락 유의)</b>: 에코프로, LG에너지솔루션, 포스코퓨처엠\n"
+    else:
+        msg += "➖ <b>2차전지 (보합 예상)</b>: 미국 테슬라 변동폭 미미, 개별 장세 예상\n"
+        
+    # 3. IT/모바일 섹터 전망 로직
+    aapl_chg = results.get('애플 (IT/모바일)', 0)
+    if aapl_chg >= 1.0:
+        msg += "📈 <b>IT/부품 (상승 예상)</b>: LG이노텍, 비에이치, 삼성전기\n"
+    elif aapl_chg <= -1.0:
+        msg += "📉 <b>IT/부품 (하락 유의)</b>: LG이노텍, 비에이치, 삼성전기\n"
+        
+    msg += "\n⚠️ <i>위 전망은 글로벌 동조화 현상에 기반한 기계적 예측입니다. 실제 개장 후 외국인/기관 수급에 따라 흐름이 달라질 수 있습니다.</i>"
+    
+    send_telegram_msg(msg)
 
 def send_daily_closing_report():
     """장 마감 종합 브리핑"""
@@ -169,13 +229,12 @@ def scan_stocks():
             df['RSI'] = calculate_rsi(df)
             df['MA20'] = df['Close'].rolling(20).mean()
             df['Disparity'] = (df['Close'] / df['MA20']) * 100
-            df['Vol_MA20'] = df['Volume'].rolling(20).mean() # 20일 평균 거래량
+            df['Vol_MA20'] = df['Volume'].rolling(20).mean() 
             
             current_price = int(df['Close'].iloc[-1])
             rsi_val = df['RSI'].iloc[-1]
             disparity_val = df['Disparity'].iloc[-1]
             
-            # 조건 1: 거래량 150% 이상 급증 여부 체크
             current_vol = df['Volume'].iloc[-1]
             avg_vol = df['Vol_MA20'].iloc[-2] if not pd.isna(df['Vol_MA20'].iloc[-2]) and df['Vol_MA20'].iloc[-2] > 0 else 1
             vol_ratio = (current_vol / avg_vol) * 100
@@ -193,25 +252,21 @@ def scan_stocks():
                 signal_type = "W+"
                 stars = "⭐"
                 
-            # 시그널이 발생했고, 거래량도 터졌을 때만 2차 검증(수급) 진행
             if signal_type and vol_ratio >= 150.0:
-                # 조건 2: 외인/기관 수급 확인 (수급 없으면 패스)
                 if not check_investor_buying(code):
                     continue
                     
-                capture_time = now_kst.strftime("%Y-%m-%d %H:%M:%S")
                 proper_price = calculate_proper_price(row, current_price)
                 margin_of_safety = ((proper_price - current_price) / proper_price) * 100.0
                 
-                # 투자 포지션 결정 (단타 vs 스윙)
                 if margin_of_safety >= 15.0:
                     trade_type = "📈 스윙 (1~4주 보유 권장)"
-                    target_price = int(current_price * 1.10) # 스윙은 목표가 +10%
-                    stop_loss = int(current_price * 0.95)    # 스윙은 손절가 -5%
+                    target_price = int(current_price * 1.10) 
+                    stop_loss = int(current_price * 0.95)    
                 else:
                     trade_type = "⚡ 단타 (1~3일 보유 권장)"
-                    target_price = int(current_price * 1.05) # 단타는 목표가 +5%
-                    stop_loss = int(current_price * 0.97)    # 단타는 손절가 -3%
+                    target_price = int(current_price * 1.05) 
+                    stop_loss = int(current_price * 0.97)    
                 
                 msg = (
                     f"🚨 <b>[뽕실로봇] {signal_type} 시그널 포착!</b> {stars}\n\n"
@@ -231,18 +286,26 @@ def scan_stocks():
                 time.sleep(1)
                 
     except Exception as e:
-        print(f"스캔 중 오류 발생: {e}")
+        pass
 
 def run_scanner():
-    global daily_summary_sent_date
+    global daily_summary_sent_date, morning_briefing_sent_date
     while True:
         now = get_kst_now()
         today_str = now.strftime("%Y-%m-%d")
         
         if now.weekday() < 5: 
+            # 1. 모닝 브리핑 (오전 7시 30분 발송)
+            if now.hour == 7 and now.minute == 30:
+                if morning_briefing_sent_date != today_str:
+                    send_morning_briefing()
+                    morning_briefing_sent_date = today_str
+
+            # 2. 개별 종목 스캔 (장 운영 시간)
             if (8 <= now.hour < 15) or (now.hour == 15 and now.minute < 30):
                 scan_stocks()
                 
+            # 3. 장 마감 브리핑 (오후 3시 30분 발송)
             if now.hour == 15 and now.minute >= 30:
                 if daily_summary_sent_date != today_str:
                     send_daily_closing_report()
@@ -252,7 +315,7 @@ def run_scanner():
 
 @app.route('/')
 def health_check():
-    return "뽕실로봇 V2 (수급+거래량 단타/스윙 추가) 정상 작동 중입니다.", 200
+    return "뽕실로봇 V3 (모닝브리핑 추가) 정상 작동 중입니다.", 200
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_scanner)
