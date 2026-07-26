@@ -78,7 +78,7 @@ def calculate_proper_price(row, current_price):
     return int(current_price * 1.12)
 
 def check_investor_buying(code):
-    """(업그레이드) 주가 하락 시 개인 매도 & 외인/기관 매수 패턴 포착"""
+    """(V5 업그레이드) 주가 하락 시 개인 매도 & 외인/기관 매수 패턴 포착"""
     try:
         url = f"https://finance.naver.com/item/frgn.naver?code={code}"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -97,24 +97,23 @@ def check_investor_buying(code):
         fore_sum = df[fore_col].astype(str).str.replace(r'[^0-9\-]', '', regex=True).replace('', '0').astype(int).sum()
         retail_sum = df[retail_col].astype(str).str.replace(r'[^0-9\-]', '', regex=True).replace('', '0').astype(int).sum()
         
-        # 핵심 로직: 개인은 팔고(털리고), 메이저는 샀는가?
         return retail_sum < 0 and (inst_sum > 0 or fore_sum > 0)
     except:
         return True 
 
 def check_kosdaq_status():
-    """(신규) 코스닥 20일선 추세 확인"""
+    """(V5 신규) 코스닥 20일선 추세 확인"""
     try:
         now_kst = get_kst_now()
         df = fdr.DataReader('KQ11', now_kst - timedelta(days=40), now_kst)
         df['MA20'] = df['Close'].rolling(20).mean()
         curr = df['Close'].iloc[-1]
         ma20 = df['MA20'].iloc[-1]
-        return curr >= ma20 # True면 상승장(적극매수), False면 하락장(보수적매수)
+        return curr >= ma20 
     except: return True
 
 def run_backtest(code, name):
-    """(신규) 과거 1년 백테스팅 엔진"""
+    """(V5 신규) 과거 1년 백테스팅 엔진"""
     try:
         now = get_kst_now()
         df = fdr.DataReader(code, now - timedelta(days=365), now)
@@ -137,13 +136,11 @@ def run_backtest(code, name):
             vol_ratio = (vol / avg_vol * 100) if avg_vol > 0 else 0
             
             if buy_price == 0:
-                # 매수 조건
                 if rsi <= 35 and vol_ratio >= 150:
                     buy_price = curr_price
                     max_price = curr_price
                     trailing = False
             else:
-                # 매도 조건 (트레일링 스톱 로직)
                 profit = ((curr_price - buy_price) / buy_price) * 100
                 if curr_price > max_price: max_price = curr_price
                 
@@ -155,7 +152,7 @@ def run_backtest(code, name):
                     if drop >= 1.5:
                         trades.append(profit)
                         buy_price = 0
-                elif profit <= -5.0: # 기본 손절 5%
+                elif profit <= -5.0:
                     trades.append(profit)
                     buy_price = 0
                     
@@ -165,7 +162,6 @@ def run_backtest(code, name):
         win_rate = (len(win_trades) / len(trades)) * 100
         avg_return = sum(trades) / len(trades)
         
-        # MDD 계산
         roll_max = df['Close'].rolling(min_periods=1, window=252).max()
         daily_drawdown = df['Close']/roll_max - 1.0
         mdd = daily_drawdown.min() * 100
@@ -244,7 +240,7 @@ def process_telegram_commands():
     except: pass
 
 def monitor_portfolio():
-    """(업그레이드) 동적 트레일링 스톱 로직"""
+    """(V5 업그레이드) 동적 트레일링 스톱 로직"""
     portfolio = load_portfolio()
     if not portfolio: return
     now_kst = get_kst_now()
@@ -263,21 +259,19 @@ def monitor_portfolio():
             curr_price = int(df['Close'].iloc[-1])
             profit_rate = ((curr_price - buy_price) / buy_price) * 100.0
             
-            # 최고가 갱신
             if curr_price > max_price:
                 info["max_price"] = curr_price
                 portfolio_changed = True
             
             signal = None
             if not trailing_active:
-                if profit_rate >= 3.0: # 3% 도달 시 트레일링 스톱 발동!
+                if profit_rate >= 3.0: 
                     info["trailing_active"] = True
                     portfolio_changed = True
                     signal = f"🚀 <b>[트레일링 스톱 가동]</b>\n수익 3%를 돌파했습니다!\n이제 최고가 대비 -1.5% 하락 시 기계적으로 익절합니다."
                 elif profit_rate <= -5.0:
                     signal = f"🛑 <b>[손절가 도달]</b>\n수익률 -5% 이탈. 손절을 권장합니다."
             else:
-                # 트레일링 스톱 발동 중 (고점 대비 하락 체크)
                 drop_rate = ((max_price - curr_price) / max_price) * 100.0
                 if drop_rate >= 1.5:
                     signal = f"🎯 <b>[트레일링 스톱 익절 발생!]</b>\n달성 최고가({max_price:,}원) 대비 -1.5% 밀렸습니다.\n수익을 확정지으세요!"
@@ -290,8 +284,73 @@ def monitor_portfolio():
         
     if portfolio_changed: save_portfolio(portfolio)
 
+def send_morning_briefing():
+    """(누락 복구) 장 시작 전 미국 증시 요약 및 섹터 전망 브리핑"""
+    now_kst = get_kst_now()
+    date_str = now_kst.strftime("%Y-%m-%d")
+    
+    tickers = {
+        '나스닥 종합지수': '^IXIC',
+        '필라델피아 반도체': '^SOX',
+        '엔비디아 (반도체)': 'NVDA',
+        '테슬라 (2차전지)': 'TSLA',
+        '애플 (IT/모바일)': 'AAPL'
+    }
+    
+    results = {}
+    for name, ticker in tickers.items():
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if len(hist) >= 2:
+                prev = hist['Close'].iloc[-2]
+                curr = hist['Close'].iloc[-1]
+                change = ((curr - prev) / prev) * 100
+                results[name] = change
+            else:
+                results[name] = 0.0
+        except:
+            results[name] = 0.0
+            
+    msg = f"🌅 <b>[뽕실로봇] {date_str} 장전 모닝 브리핑</b>\n\n🇺🇸 <b>[밤사이 미국 증시 마감]</b>\n"
+    
+    for name, chg in results.items():
+        icon = "🔴" if chg < 0 else "🟢"
+        sign = "+" if chg > 0 else ""
+        msg += f"{icon} {name}: {sign}{chg:.2f}%\n"
+        
+    msg += "\n💡 <b>[오늘의 장초반 국내 섹터 전망]</b>\n"
+    
+    nvda_chg = results.get('엔비디아 (반도체)', 0)
+    if nvda_chg >= 1.5: msg += "📈 <b>반도체 (상승 예상)</b>: 삼성전자, SK하이닉스, 한미반도체\n"
+    elif nvda_chg <= -1.5: msg += "📉 <b>반도체 (하락 유의)</b>: 삼성전자, SK하이닉스, 한미반도체\n"
+    else: msg += "➖ <b>반도체 (보합 예상)</b>: 미국 반도체 변동폭 미미, 개별 장세 예상\n"
+        
+    tsla_chg = results.get('테슬라 (2차전지)', 0)
+    if tsla_chg >= 1.5: msg += "📈 <b>2차전지 (상승 예상)</b>: 에코프로, LG에너지솔루션, 포스코퓨처엠\n"
+    elif tsla_chg <= -1.5: msg += "📉 <b>2차전지 (하락 유의)</b>: 에코프로, LG에너지솔루션, 포스코퓨처엠\n"
+    else: msg += "➖ <b>2차전지 (보합 예상)</b>: 미국 테슬라 변동폭 미미, 개별 장세 예상\n"
+        
+    aapl_chg = results.get('애플 (IT/모바일)', 0)
+    if aapl_chg >= 1.0: msg += "📈 <b>IT/부품 (상승 예상)</b>: LG이노텍, 비에이치, 삼성전기\n"
+    elif aapl_chg <= -1.0: msg += "📉 <b>IT/부품 (하락 유의)</b>: LG이노텍, 비에이치, 삼성전기\n"
+        
+    msg += "\n⚠️ <i>위 전망은 글로벌 동조화 현상에 기반한 기계적 예측입니다.</i>"
+    send_telegram_msg(msg)
+
+def send_daily_closing_report():
+    """(누락 복구) 장 마감 종합 브리핑"""
+    global sent_signals_today
+    now_kst = get_kst_now()
+    date_str = now_kst.strftime("%Y-%m-%d")
+    
+    if not sent_signals_today:
+        msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 종합 브리핑</b>\n\n오늘 장 운영 시간 동안 포착된 시그널 종목이 없습니다."
+    else:
+        stocks_list = "\n".join([f"• {item}" for item in sent_signals_today])
+        msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 종합 브리핑</b>\n\n오늘 총 <b>{len(sent_signals_today)}개</b>의 종목 시그널이 포착되었습니다!\n\n<b>[포착된 종목 리스트]</b>\n{stocks_list}\n\n💡 <i>내일 장에서 성공적인 투자 되시길 바랍니다!</i>"
+    send_telegram_msg(msg)
+
 def scan_stocks():
-    """(업그레이드) 시장 상태 필터 적용 스캐너"""
     global sent_signals_today, last_reset_date
     now_kst = get_kst_now()
     today_str = now_kst.strftime("%Y-%m-%d")
@@ -300,7 +359,7 @@ def scan_stocks():
         sent_signals_today.clear()
         last_reset_date = today_str
 
-    is_market_good = check_kosdaq_status() # 코스닥 20일선 추세
+    is_market_good = check_kosdaq_status() 
     
     try:
         krx = fdr.StockListing('KRX')
@@ -324,14 +383,13 @@ def scan_stocks():
             vol_ratio = (current_vol / avg_vol) * 100.0
             
             if rsi_val <= 33 and vol_ratio >= 150.0:
-                if not check_investor_buying(code): continue # 개미털기 확인
+                if not check_investor_buying(code): continue 
                     
                 proper_price = calculate_proper_price(row, current_price)
                 margin_of_safety = ((proper_price - current_price) / proper_price) * 100.0
                 
-                # 하락장 방어 로직
                 if not is_market_good and margin_of_safety < 30.0:
-                    continue # 하락장에서는 초저평가(30% 이상) 아니면 패스
+                    continue 
                 
                 msg = (
                     f"🚨 <b>[V5 시그널 포착!]</b> ⭐⭐⭐\n\n"
@@ -351,23 +409,38 @@ def scan_stocks():
     except: pass
 
 def run_scanner():
+    global morning_briefing_sent_date, daily_summary_sent_date
     tick_count = 0
     while True:
         try:
             now = get_kst_now()
+            today_str = now.strftime("%Y-%m-%d")
+            
             process_telegram_commands()
             
             if now.weekday() < 5: 
+                # [복구됨] 모닝 브리핑 (오전 7시 30분 발송)
+                if now.hour == 7 and now.minute == 30 and morning_briefing_sent_date != today_str:
+                    send_morning_briefing()
+                    morning_briefing_sent_date = today_str
+
+                # 장 운영 시간 스캔 (09:00 ~ 15:30)
                 if (9 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30):
                     scan_stocks()
                     if tick_count % 15 == 0: monitor_portfolio()
+                    
+                # [복구됨] 장 마감 브리핑 (오후 3시 35분 발송)
+                if now.hour == 15 and now.minute >= 35 and daily_summary_sent_date != today_str:
+                    send_daily_closing_report()
+                    daily_summary_sent_date = today_str
+                    
             tick_count += 1
         except: pass
         time.sleep(15) 
 
 @app.route('/')
 def health_check():
-    return "뽕실로봇 V5 정상 작동 중입니다.", 200
+    return "뽕실로봇 V5 (브리핑 복구 완료) 정상 작동 중입니다.", 200
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_scanner)
