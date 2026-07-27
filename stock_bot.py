@@ -16,11 +16,15 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 PORTFOLIO_FILE = "portfolio.json"
 
-sent_signals_today = set()
-sidecar_alerts_today = set()
+# 글로벌 상태 변수
+sent_signals_today = {} # (변경) 중복 알림 쿨타임 계산을 위해 딕셔너리로 변경
 last_reset_date = None
 daily_summary_sent_date = None
 morning_briefing_sent_date = None
+nxt_open_sent_date = None
+reg_open_sent_date = None
+reg_close_sent_date = None
+nxt_close_sent_date = None
 last_update_id = 0
 
 # 전 종목 코드 매핑 딕셔너리
@@ -78,7 +82,7 @@ def calculate_proper_price(row, current_price):
     return int(current_price * 1.12)
 
 def check_investor_buying(code):
-    """(V5 업그레이드) 주가 하락 시 개인 매도 & 외인/기관 매수 패턴 포착"""
+    """주가 하락 시 개인 매도 & 외인/기관 매수 패턴 포착"""
     try:
         url = f"https://finance.naver.com/item/frgn.naver?code={code}"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -102,7 +106,7 @@ def check_investor_buying(code):
         return True 
 
 def check_kosdaq_status():
-    """(V5 신규) 코스닥 20일선 추세 확인"""
+    """코스닥 20일선 추세 확인"""
     try:
         now_kst = get_kst_now()
         df = fdr.DataReader('KQ11', now_kst - timedelta(days=40), now_kst)
@@ -113,7 +117,7 @@ def check_kosdaq_status():
     except: return True
 
 def run_backtest(code, name):
-    """(V5 신규) 과거 1년 백테스팅 엔진"""
+    """과거 1년 백테스팅 엔진"""
     try:
         now = get_kst_now()
         df = fdr.DataReader(code, now - timedelta(days=365), now)
@@ -236,11 +240,28 @@ def process_telegram_commands():
                     else: send_telegram_msg("⚠️ 종목을 찾을 수 없습니다.")
                 else: send_telegram_msg("⚠️ 양식: /백테스트 [종목명]")
             elif cmd == "/도움말":
-                send_telegram_msg("🤖 <b>V5 명령어</b>\n/매수 [종목] [단가]\n/매도완료 [종목]\n/수정 [종목] [단가]\n/목록\n/백테스트 [종목명]")
+                help_msg = (
+                    "🤖 <b>[뽕실로봇 V5 명령어 가이드]</b>\n\n"
+                    "🔹 <b>/매수 [종목명] [매수가]</b>\n"
+                    "  - 예: /매수 삼성전자 80000\n"
+                    "  - 로봇의 감시 목록에 추가하고 즉시 트레일링 스톱을 가동합니다.\n\n"
+                    "🔹 <b>/수정 [종목명] [매수가]</b>\n"
+                    "  - 예: /수정 삼성전자 79000\n"
+                    "  - 기존에 감시 중인 종목의 매수 평단가를 수정합니다.\n\n"
+                    "🔹 <b>/매도완료 [종목명]</b>\n"
+                    "  - 예: /매도완료 삼성전자\n"
+                    "  - 익절/손절이 완료된 종목을 감시 목록에서 삭제합니다.\n\n"
+                    "🔹 <b>/목록</b>\n"
+                    "  - 현재 로봇이 감시 중인 종목 리스트와 진행 상태(트레일링)를 확인합니다.\n\n"
+                    "🔹 <b>/백테스트 [종목명]</b>\n"
+                    "  - 예: /백테스트 SK하이닉스\n"
+                    "  - 해당 종목의 과거 1년간 뽕실로봇 매매 시그널 결과를 시뮬레이션하여 승률과 수익률을 알려줍니다."
+                )
+                send_telegram_msg(help_msg)
     except: pass
 
 def monitor_portfolio():
-    """(V5 업그레이드) 동적 트레일링 스톱 로직"""
+    """동적 트레일링 스톱 로직"""
     portfolio = load_portfolio()
     if not portfolio: return
     now_kst = get_kst_now()
@@ -285,7 +306,7 @@ def monitor_portfolio():
     if portfolio_changed: save_portfolio(portfolio)
 
 def send_morning_briefing():
-    """(누락 복구) 장 시작 전 미국 증시 요약 및 섹터 전망 브리핑"""
+    """장 시작 전 미국 증시 요약 및 섹터 전망 브리핑"""
     now_kst = get_kst_now()
     date_str = now_kst.strftime("%Y-%m-%d")
     
@@ -338,7 +359,7 @@ def send_morning_briefing():
     send_telegram_msg(msg)
 
 def send_daily_closing_report():
-    """(누락 복구) 장 마감 종합 브리핑"""
+    """(변경) 장 마감 종합 브리핑 딕셔너리 호환 적용"""
     global sent_signals_today
     now_kst = get_kst_now()
     date_str = now_kst.strftime("%Y-%m-%d")
@@ -346,7 +367,7 @@ def send_daily_closing_report():
     if not sent_signals_today:
         msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 종합 브리핑</b>\n\n오늘 장 운영 시간 동안 포착된 시그널 종목이 없습니다."
     else:
-        stocks_list = "\n".join([f"• {item}" for item in sent_signals_today])
+        stocks_list = "\n".join([f"• {info['name']}" for code, info in sent_signals_today.items()])
         msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 종합 브리핑</b>\n\n오늘 총 <b>{len(sent_signals_today)}개</b>의 종목 시그널이 포착되었습니다!\n\n<b>[포착된 종목 리스트]</b>\n{stocks_list}\n\n💡 <i>내일 장에서 성공적인 투자 되시길 바랍니다!</i>"
     send_telegram_msg(msg)
 
@@ -363,12 +384,18 @@ def scan_stocks():
     
     try:
         krx = fdr.StockListing('KRX')
-        top_stocks = krx.sort_values(by='Marcap', ascending=False).head(150)
+        # [변경] 검색 대상을 시총 상위 200개로 조정
+        top_stocks = krx.sort_values(by='Marcap', ascending=False).head(200)
         
         for idx, row in top_stocks.iterrows():
             code = row['Code']
             name = row['Name']
-            if code in sent_signals_today: continue
+            
+            # [변경] 중복 알림 허용하되, 1시간(3600초) 쿨타임 적용 방어 로직
+            if code in sent_signals_today:
+                last_time = sent_signals_today[code]['time']
+                if (now_kst - last_time).total_seconds() < 3600:
+                    continue # 1시간 이내면 패스
             
             df = fdr.DataReader(code, now_kst - timedelta(days=60), now_kst)
             if len(df) < 20: continue
@@ -382,7 +409,7 @@ def scan_stocks():
             avg_vol = df['Vol_MA20'].iloc[-2] if not pd.isna(df['Vol_MA20'].iloc[-2]) and df['Vol_MA20'].iloc[-2] > 0 else 1
             vol_ratio = (current_vol / avg_vol) * 100.0
             
-            if rsi_val <= 33 and vol_ratio >= 150.0:
+            if rsi_val <= 35 and vol_ratio >= 150.0:
                 if not check_investor_buying(code): continue 
                     
                 proper_price = calculate_proper_price(row, current_price)
@@ -404,13 +431,17 @@ def scan_stocks():
                     f"💡 <i>명령어: /매수 {name} {current_price}</i>"
                 )
                 send_telegram_msg(msg)
-                sent_signals_today.add(code)
+                
+                # [변경] 딕셔너리에 종목명과 현재 전송된 시간 저장 (쿨타임 리셋 및 장마감 브리핑용)
+                sent_signals_today[code] = {'name': name, 'time': now_kst}
                 time.sleep(1)
     except: pass
 
 def run_scanner():
     global morning_briefing_sent_date, daily_summary_sent_date
+    global nxt_open_sent_date, reg_open_sent_date, reg_close_sent_date, nxt_close_sent_date
     tick_count = 0
+    
     while True:
         try:
             now = get_kst_now()
@@ -419,20 +450,33 @@ def run_scanner():
             process_telegram_commands()
             
             if now.weekday() < 5: 
-                # [복구됨] 모닝 브리핑 (오전 7시 30분 발송)
-                if now.hour == 7 and now.minute == 30 and morning_briefing_sent_date != today_str:
+                if now.hour == 7 and 30 <= now.minute < 35 and morning_briefing_sent_date != today_str:
                     send_morning_briefing()
                     morning_briefing_sent_date = today_str
 
-                # 장 운영 시간 스캔 (09:00 ~ 15:30)
-                if (9 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30):
+                if now.hour == 8 and 0 <= now.minute < 5 and nxt_open_sent_date != today_str:
+                    send_telegram_msg("🔔 <b>[NXT 장 시작]</b>\n오전 8시입니다. 대체거래소(NXT) 프리마켓 거래가 시작되었습니다.")
+                    nxt_open_sent_date = today_str
+
+                if now.hour == 9 and 0 <= now.minute < 5 and reg_open_sent_date != today_str:
+                    send_telegram_msg("🔔 <b>[정규장 시작]</b>\n오전 9시입니다. 정규장 거래가 시작되었습니다. 종목 감시를 본격적으로 가동합니다.")
+                    reg_open_sent_date = today_str
+
+                if 8 <= now.hour < 20:
                     scan_stocks()
                     if tick_count % 15 == 0: monitor_portfolio()
                     
-                # [복구됨] 장 마감 브리핑 (오후 3시 35분 발송)
-                if now.hour == 15 and now.minute >= 35 and daily_summary_sent_date != today_str:
+                if now.hour == 15 and 30 <= now.minute < 35 and reg_close_sent_date != today_str:
+                    send_telegram_msg("🔔 <b>[정규장 마감]</b>\n오후 3시 30분입니다. 정규장 거래가 종료되었습니다. (NXT 애프터마켓은 계속 진행됩니다)")
+                    reg_close_sent_date = today_str
+
+                if now.hour == 15 and 35 <= now.minute < 40 and daily_summary_sent_date != today_str:
                     send_daily_closing_report()
                     daily_summary_sent_date = today_str
+                    
+                if now.hour == 20 and 0 <= now.minute < 5 and nxt_close_sent_date != today_str:
+                    send_telegram_msg("🔔 <b>[NXT 장 마감]</b>\n오후 8시입니다. 대체거래소(NXT) 애프터마켓 거래가 모두 종료되었습니다. 편안한 밤 되세요!")
+                    nxt_close_sent_date = today_str
                     
             tick_count += 1
         except: pass
@@ -440,7 +484,7 @@ def run_scanner():
 
 @app.route('/')
 def health_check():
-    return "뽕실로봇 V5 (브리핑 복구 완료) 정상 작동 중입니다.", 200
+    return "뽕실로봇 V5 (200개 스캔 / 중복 알림 허용) 정상 작동 중입니다.", 200
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_scanner)
