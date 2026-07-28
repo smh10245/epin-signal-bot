@@ -88,6 +88,17 @@ def get_estimated_daily_volume(current_vol, now_kst):
     estimated_vol = current_vol * (390 / elapsed_minutes)
     return estimated_vol
 
+def calculate_fair_value(df):
+    """
+    단기 낙폭과대(RSI 저점) 종목의 평균회귀를 가정한 60일 이동평균선 기반 적정가
+    과도한 웹 크롤링을 피하고 기술적 데이터만으로 보수적인 밸류에이션을 산정합니다.
+    """
+    try:
+        # 최근 60일(데이터프레임 전체)의 평균 종가를 적정 가격으로 간주
+        return int(df['Close'].mean())
+    except:
+        return int(df['Close'].iloc[-1])
+
 def calculate_target_price(df, current_price):
     """20일 이동평균선과 피보나치 50% 되돌림을 활용한 보수적 목표가 산정"""
     try:
@@ -95,10 +106,7 @@ def calculate_target_price(df, current_price):
         recent_high = df['High'].rolling(20).max().iloc[-1]
         recent_low = df['Low'].rolling(20).min().iloc[-1]
         
-        # 고점과 저점의 중간값 (50% 되돌림)
         fibo_50 = recent_low + (recent_high - recent_low) * 0.5
-        
-        # 20일선과 50% 되돌림 중 보수적인(낮은) 가격을 목표가로 설정
         target = min(ma20, fibo_50)
         
         if target > current_price:
@@ -106,7 +114,6 @@ def calculate_target_price(df, current_price):
     except:
         pass
     
-    # 실패 시 단타/스윙 현실성에 맞게 5% 상향으로 수정
     return int(current_price * 1.05)
 
 def check_investor_buying(code):
@@ -146,17 +153,21 @@ def check_kosdaq_status():
     except: return True
 
 def get_signal_tier(rsi_val, vol_ratio, investor_ok, upside_potential, is_market_good):
-    """시그널 강도 5단계 세분화 평가"""
+    """
+    시그널 강도 3단계 압축 (필터링 강화)
+    하위 등급(기존 1~2성급)은 알림을 보내지 않고 과감히 스킵합니다.
+    """
+    # 기존 5성급 -> 현 3성급 (⭐3)
     if rsi_val <= 35 and vol_ratio >= 100.0 and investor_ok and upside_potential >= 15.0 and is_market_good:
-        return "⭐⭐⭐⭐⭐", "강력추천"
+        return "⭐⭐⭐", "강력추천"
+    # 기존 4성급 -> 현 2성급 (⭐2)
     elif rsi_val <= 40 and vol_ratio >= 90.0 and investor_ok:
-        return "⭐⭐⭐⭐", "매우좋음"
+        return "⭐⭐", "매우좋음"
+    # 기존 3성급 -> 현 1성급 (⭐1)
     elif rsi_val <= 42 and vol_ratio >= 80.0:
-        return "⭐⭐⭐", "좋음"
-    elif rsi_val <= 45 and vol_ratio >= 70.0:
-        return "⭐⭐", "보통"
-    elif rsi_val <= 45 and vol_ratio >= 50.0:
-        return "⭐", "조건충족"
+        return "⭐", "좋음"
+        
+    # 그 외 조건(RSI 43~45 등)은 시그널 미발생
     return None, None
 
 def run_backtest(code, name):
@@ -183,7 +194,8 @@ def run_backtest(code, name):
             vol_ratio = (vol / avg_vol * 100) if avg_vol > 0 else 0
             
             if buy_price == 0:
-                if rsi <= 45 and vol_ratio >= 80:
+                # 백테스트 매수 조건도 3성급 최소 조건으로 동기화
+                if rsi <= 42 and vol_ratio >= 80:
                     buy_price = curr_price
                     max_price = curr_price
                     trailing = False
@@ -203,7 +215,7 @@ def run_backtest(code, name):
                     trades.append(profit)
                     buy_price = 0
                     
-        if not trades: return f"📊 <b>[{name}] 백테스트 결과</b>\n지난 1년간 해당 로직에 포착된 매수 타점이 없습니다."
+        if not trades: return f"📊 <b>[{name}] 백테스트 결과</b>\n지난 1년간 엄격해진 현 로직에 포착된 매수 타점이 없습니다."
         
         win_trades = [t for t in trades if t > 0]
         win_rate = (len(win_trades) / len(trades)) * 100
@@ -215,7 +227,7 @@ def run_backtest(code, name):
         
         msg = (
             f"📊 <b>[{name}] 1년 백테스트 결과</b>\n"
-            f"<i>(조건 완화버전 적용)</i>\n\n"
+            f"<i>(압축된 3단계 상위 시그널 적용)</i>\n\n"
             f"• <b>총 매매 횟수:</b> {len(trades)}회\n"
             f"• <b>승률:</b> {win_rate:.1f}%\n"
             f"• <b>평균 수익률:</b> {avg_return:+.2f}%\n"
@@ -295,7 +307,7 @@ def process_telegram_commands():
                 else: send_telegram_msg("⚠️ 양식: /백테스트 [종목명]")
             elif cmd == "/도움말":
                 help_msg = (
-                    "🤖 <b>[뽕실로봇 V5.1 명령어가이드]</b>\n\n"
+                    "🤖 <b>[뽕실로봇 V5.2 명령어가이드]</b>\n\n"
                     "🔹 <b>/매수 [종목] [단가] [단타/스윙]</b>\n"
                     "  - 예: <code>/매수 삼성전자 80000 단타</code>\n"
                     "🔹 <b>/수정 [종목] [단가] [단타/스윙]</b>\n"
@@ -332,7 +344,6 @@ def monitor_portfolio():
                 info["max_price"] = curr_price
                 portfolio_changed = True
             
-            # 단타/스윙 기준 세팅
             if trade_type == "단타":
                 target_trigger = 2.0   
                 trailing_drop = 1.0    
@@ -381,7 +392,6 @@ def monitor_portfolio():
                 send_telegram_msg(msg)
                 time.sleep(1)
         except Exception as e: 
-            print(f"[{name}] 모니터링 중 에러: {e}")
             continue
         
     if portfolio_changed: save_portfolio(portfolio)
@@ -437,10 +447,10 @@ def send_daily_closing_report():
     date_str = now_kst.strftime("%Y-%m-%d")
     
     if not sent_signals_today:
-        msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 브리핑</b>\n\n오늘 장 중 포착된 시그널 종목이 없습니다."
+        msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 브리핑</b>\n\n오늘 장 중 포착된 3성급 이상의 시그널 종목이 없습니다."
     else:
         stocks_list = "\n".join([f"• {info['name']}" for code, info in sent_signals_today.items()])
-        msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 브리핑</b>\n\n오늘 총 <b>{len(sent_signals_today)}개</b>의 시그널이 포착되었습니다!\n\n<b>[포착 종목 리스트]</b>\n{stocks_list}"
+        msg = f"📋 <b>[뽕실로봇] {date_str} 장 마감 브리핑</b>\n\n오늘 총 <b>{len(sent_signals_today)}개</b>의 고효율 시그널이 포착되었습니다!\n\n<b>[포착 종목 리스트]</b>\n{stocks_list}"
     send_telegram_msg(msg)
 
 def scan_stocks():
@@ -457,20 +467,17 @@ def scan_stocks():
     
     try:
         krx = fdr.StockListing('KRX')
-        # 종목 풀 확장: 대형주 200개 -> 300개로 넓혀서 포착 확률 상향
         top_stocks = krx.sort_values(by='Marcap', ascending=False).head(300) 
         
         for idx, row in top_stocks.iterrows():
             code = row['Code']
             name = row['Name']
             
-            # 1시간 쿨타임 체크
             if code in sent_signals_today:
                 if (now_kst - sent_signals_today[code]['time']).total_seconds() < 3600:
                     continue
             
             try:
-                # 60일치 데이터로 넉넉하게 분석
                 df = fdr.DataReader(code, now_kst - timedelta(days=60), now_kst)
                 if len(df) < 20: continue
                 
@@ -482,50 +489,45 @@ def scan_stocks():
                 current_vol = df['Volume'].iloc[-1]
                 avg_vol = df['Vol_MA20'].iloc[-2] if not pd.isna(df['Vol_MA20'].iloc[-2]) and df['Vol_MA20'].iloc[-2] > 0 else 1
                 
-                # 당일 환산 거래량 적용
                 estimated_vol = get_estimated_daily_volume(current_vol, now_kst)
                 vol_ratio = (estimated_vol / avg_vol) * 100.0
                 
-                # 조건 완화: RSI 45 이하 & 거래량 평소 대비 50% 이상 (하락장 거래량 마름 현상 반영)
-                if rsi_val <= 45.0 and vol_ratio >= 50.0:
-                    
-                    # 기술적 통과 종목만 수급 및 목표가 계산 (과도한 웹 크롤링 방지)
-                    investor_ok = check_investor_buying(code)
-                    target_price = calculate_target_price(df, current_price)
-                    
-                    upside_potential = ((target_price - current_price) / current_price) * 100.0
-                    
-                    # 5단계 세분화 평가
-                    stars, tier_label = get_signal_tier(rsi_val, vol_ratio, investor_ok, upside_potential, is_market_good)
-                    if not stars: continue 
-                    
-                    msg = (
-                        f"🚨 <b>[V5.1 시그널 포착!]</b> {stars}\n"
-                        f"<b>[강도: {tier_label}]</b>\n\n"
-                        f"📌 <b>종목명:</b> {name} ({code})\n"
-                        f"💰 <b>현재가:</b> {current_price:,}원\n"
-                        f"💎 <b>보수적 목표가:</b> {target_price:,}원 (상승여력 {upside_potential:+.1f}%)\n\n"
-                        f"📊 <b>[포착 근거]</b>\n"
-                        f"• <b>RSI:</b> {rsi_val:.1f} (바닥권 감시)\n"
-                        f"• <b>예상 환산 거래량:</b> 평소 대비 {vol_ratio:.1f}%\n"
-                        f"• <b>수급:</b> {'개미털기(외인기관매수)' if investor_ok else '보통'}\n\n"
-                        f"💡 <b>추천 명령어:</b>\n"
-                        f"• 단타 매수: <code>/매수 {name} {current_price} 단타</code>\n"
-                        f"• 스윙 매수: <code>/매수 {name} {current_price} 스윙</code>"
-                    )
-                    send_telegram_msg(msg)
-                    sent_signals_today[code] = {'name': name, 'time': now_kst}
-                    
-                    # 네이버 블락 방지를 위한 안전 딜레이
-                    time.sleep(1.5) 
+                investor_ok = check_investor_buying(code)
+                target_price = calculate_target_price(df, current_price)
+                fair_value = calculate_fair_value(df)
+                
+                upside_potential = ((target_price - current_price) / current_price) * 100.0
+                
+                # V5.2 3단계 세분화 평가 적용 (이전보다 훨씬 까다로움)
+                stars, tier_label = get_signal_tier(rsi_val, vol_ratio, investor_ok, upside_potential, is_market_good)
+                if not stars: continue 
+                
+                msg = (
+                    f"🚨 <b>[V5.2 시그널 포착!]</b> {stars}\n"
+                    f"<b>[강도: {tier_label}]</b>\n\n"
+                    f"📌 <b>종목명:</b> {name} ({code})\n"
+                    f"💰 <b>현재가:</b> {current_price:,}원\n"
+                    f"⚖️ <b>단기 적정가(60일선 평균회귀):</b> {fair_value:,}원\n"
+                    f"💎 <b>보수적 목표가:</b> {target_price:,}원 (상승여력 {upside_potential:+.1f}%)\n\n"
+                    f"📊 <b>[포착 근거]</b>\n"
+                    f"• <b>RSI:</b> {rsi_val:.1f} (바닥권 감시)\n"
+                    f"• <b>예상 환산 거래량:</b> 평소 대비 {vol_ratio:.1f}%\n"
+                    f"• <b>수급:</b> {'개미털기(외인기관매수)' if investor_ok else '보통'}\n\n"
+                    f"💡 <b>추천 명령어:</b>\n"
+                    f"• 단타 매수: <code>/매수 {name} {current_price} 단타</code>\n"
+                    f"• 스윙 매수: <code>/매수 {name} {current_price} 스윙</code>"
+                )
+                send_telegram_msg(msg)
+                sent_signals_today[code] = {'name': name, 'time': now_kst}
+                
+                time.sleep(1.5) 
 
             except Exception as e:
-                # 개별 종목 데이터 크롤링 에러 발생 시 로그 (최초 1회만 받기 위해 break)
                 error_msg = f"⚠️ [데이터 수집 오류] {name}({code})\n{str(e)}"
                 send_telegram_msg(error_msg)
                 print(error_msg)
                 time.sleep(5) 
-                break # 에러가 한 번 나면 해당 주기 전체 스캔 중단 (IP 차단 확인용)
+                break 
                 
     except Exception as e: 
         send_telegram_msg(f"🚨 [시스템 치명적 오류]\n전체 종목 스캔 중 에러 발생: {e}")
@@ -540,11 +542,9 @@ def run_scanner():
             now = get_kst_now()
             today_str = now.strftime("%Y-%m-%d")
             
-            # 텔레그램 명령어 처리는 자주(15초마다) 확인
             process_telegram_commands()
             
             if now.weekday() < 5: 
-                # 미국 증시 브리핑 (오전 07:30 ~ 07:35 사이 1회)
                 if now.hour == 7 and 30 <= now.minute < 35 and morning_briefing_sent_date != today_str:
                     send_morning_briefing()
                     morning_briefing_sent_date = today_str
@@ -557,13 +557,10 @@ def run_scanner():
                     send_telegram_msg("🔔 <b>[정규장 시작]</b>\n정규장 거래가 시작되었습니다. 시그널 스캔을 가동합니다.")
                     reg_open_sent_date = today_str
 
-                # 스캔 타임 (08:00 ~ 20:00)
                 if 8 <= now.hour < 20:
-                    # IP 차단 방지: 종목 스캔은 15초가 아닌 3분(180초)에 한 번씩만 실행되도록 분리
                     if tick_count % 12 == 0: 
                         scan_stocks()
                         
-                    # 보유 종목 감시는 1분(60초)마다 한 번씩 실행
                     if tick_count % 4 == 0: 
                         monitor_portfolio()
                     
@@ -587,7 +584,7 @@ def run_scanner():
 
 @app.route('/')
 def health_check():
-    return "뽕실로봇 V5.1 (조건완화 & IP 차단방지 적용됨) 정상 작동 중입니다.", 200
+    return "뽕실로봇 V5.2 (시그널 압축 & 적정가 도입) 정상 작동 중입니다.", 200
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_scanner)
