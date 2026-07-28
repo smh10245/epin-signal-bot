@@ -61,7 +61,8 @@ def send_telegram_msg(message):
         print(f"텔레그램 전송 실패: {e}")
 
 def get_kst_now():
-    return datetime.now(timezone(timedelta(hours=9)))
+    """KST 시간을 반환하되, fdr/pandas와의 충돌 방지를 위해 시간대 정보(tzinfo)를 제거한 tz-naive 객체로 반환"""
+    return datetime.now(timezone(timedelta(hours=9))).replace(tzinfo=None)
 
 def calculate_rsi(data, window=14):
     delta = data['Close'].diff()
