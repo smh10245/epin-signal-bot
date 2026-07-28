@@ -70,18 +70,43 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+def get_estimated_daily_volume(current_vol, now_kst):
+    """현재 장중 시간을 기준으로 당일 마감 예상 거래량을 산출합니다."""
+    market_open = now_kst.replace(hour=9, minute=0, second=0, microsecond=0)
+    market_close = now_kst.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    # 장 시작 전이거나 마감 이후면 현재 거래량 그대로 반환
+    if now_kst <= market_open or now_kst >= market_close:
+        return current_vol
+        
+    elapsed_minutes = (now_kst - market_open).total_seconds() / 60
+    if elapsed_minutes <= 0: 
+        return current_vol
+        
+    # 390분(정규장) 기준 비례식 적용
+    estimated_vol = current_vol * (390 / elapsed_minutes)
+    return estimated_vol
+
 def calculate_target_price(df, current_price):
-    """
-    기존 S-RIM 계산 오류를 대체하는 함수.
-    최근 60일 최고가를 '기술적 반등 목표가'로 설정하여 상승 여력을 계산합니다.
-    """
+    """20일 이동평균선과 피보나치 50% 되돌림을 활용한 보수적 목표가 산정"""
     try:
-        recent_high = df['High'].max()
-        if recent_high > current_price:
-            return int(recent_high)
+        ma20 = df['Close'].rolling(20).mean().iloc[-1]
+        recent_high = df['High'].rolling(20).max().iloc[-1]
+        recent_low = df['Low'].rolling(20).min().iloc[-1]
+        
+        # 고점과 저점의 중간값 (50% 되돌림)
+        fibo_50 = recent_low + (recent_high - recent_low) * 0.5
+        
+        # 20일선과 50% 되돌림 중 보수적인(낮은) 가격을 목표가로 설정
+        target = min(ma20, fibo_50)
+        
+        if target > current_price:
+            return int(target)
     except:
         pass
-    return int(current_price * 1.12) # 실패 시 임시로 12% 위를 목표가로 설정
+    
+    # 실패 시 단타/스윙 현실성에 맞게 5% 상향으로 수정
+    return int(current_price * 1.05)
 
 def check_investor_buying(code):
     """주가 하락 시 개인 매도 & 외인/기관 매수 패턴 포착"""
@@ -120,7 +145,7 @@ def check_kosdaq_status():
     except: return True
 
 def get_signal_tier(rsi_val, vol_ratio, investor_ok, upside_potential, is_market_good):
-    """시그널 강도 5단계 세분화 평가 (조건 완화 적용)"""
+    """시그널 강도 5단계 세분화 평가"""
     if rsi_val <= 35 and vol_ratio >= 100.0 and investor_ok and upside_potential >= 15.0 and is_market_good:
         return "⭐⭐⭐⭐⭐", "강력추천"
     elif rsi_val <= 40 and vol_ratio >= 90.0 and investor_ok:
@@ -156,7 +181,6 @@ def run_backtest(code, name):
             avg_vol = df['Vol_MA20'].iloc[i-2]
             vol_ratio = (vol / avg_vol * 100) if avg_vol > 0 else 0
             
-            # 매수 조건 (백테스트도 완화된 조건 적용)
             if buy_price == 0:
                 if rsi <= 45 and vol_ratio >= 80:
                     buy_price = curr_price
@@ -444,54 +468,66 @@ def scan_stocks():
                 if (now_kst - sent_signals_today[code]['time']).total_seconds() < 3600:
                     continue
             
-            # 60일치 데이터로 넉넉하게 분석
-            df = fdr.DataReader(code, now_kst - timedelta(days=60), now_kst)
-            if len(df) < 20: continue
-            
-            df['RSI'] = calculate_rsi(df)
-            df['Vol_MA20'] = df['Volume'].rolling(20).mean() 
-            
-            current_price = int(df['Close'].iloc[-1])
-            rsi_val = df['RSI'].iloc[-1]
-            current_vol = df['Volume'].iloc[-1]
-            avg_vol = df['Vol_MA20'].iloc[-2] if not pd.isna(df['Vol_MA20'].iloc[-2]) and df['Vol_MA20'].iloc[-2] > 0 else 1
-            vol_ratio = (current_vol / avg_vol) * 100.0
-            
-            # 조건 완화: RSI 45 이하 & 거래량 평소 대비 50% 이상 (하락장 거래량 마름 현상 반영)
-            if rsi_val <= 45.0 and vol_ratio >= 50.0:
+            try:
+                # 60일치 데이터로 넉넉하게 분석
+                df = fdr.DataReader(code, now_kst - timedelta(days=60), now_kst)
+                if len(df) < 20: continue
                 
-                # 기술적 통과 종목만 수급 및 목표가 계산 (과도한 웹 크롤링 방지)
-                investor_ok = check_investor_buying(code)
-                target_price = calculate_target_price(df, current_price)
+                df['RSI'] = calculate_rsi(df)
+                df['Vol_MA20'] = df['Volume'].rolling(20).mean() 
                 
-                upside_potential = ((target_price - current_price) / current_price) * 100.0
+                current_price = int(df['Close'].iloc[-1])
+                rsi_val = df['RSI'].iloc[-1]
+                current_vol = df['Volume'].iloc[-1]
+                avg_vol = df['Vol_MA20'].iloc[-2] if not pd.isna(df['Vol_MA20'].iloc[-2]) and df['Vol_MA20'].iloc[-2] > 0 else 1
                 
-                # 5단계 세분화 평가 (새로운 로직 적용)
-                stars, tier_label = get_signal_tier(rsi_val, vol_ratio, investor_ok, upside_potential, is_market_good)
-                if not stars: continue 
+                # 당일 환산 거래량 적용
+                estimated_vol = get_estimated_daily_volume(current_vol, now_kst)
+                vol_ratio = (estimated_vol / avg_vol) * 100.0
                 
-                msg = (
-                    f"🚨 <b>[V5.1 시그널 포착!]</b> {stars}\n"
-                    f"<b>[강도: {tier_label}]</b>\n\n"
-                    f"📌 <b>종목명:</b> {name} ({code})\n"
-                    f"💰 <b>현재가:</b> {current_price:,}원\n"
-                    f"💎 <b>60일기준 목표가:</b> {target_price:,}원 (상승여력 {upside_potential:+.1f}%)\n\n"
-                    f"📊 <b>[포착 근거]</b>\n"
-                    f"• <b>RSI:</b> {rsi_val:.1f} (바닥권 감시)\n"
-                    f"• <b>거래량:</b> 평소 대비 {vol_ratio:.1f}%\n"
-                    f"• <b>수급:</b> {'개미털기(외인기관매수)' if investor_ok else '보통'}\n\n"
-                    f"💡 <b>추천 명령어:</b>\n"
-                    f"• 단타 매수: <code>/매수 {name} {current_price} 단타</code>\n"
-                    f"• 스윙 매수: <code>/매수 {name} {current_price} 스윙</code>"
-                )
-                send_telegram_msg(msg)
-                sent_signals_today[code] = {'name': name, 'time': now_kst}
-                
-                # 네이버 블락 방지를 위한 안전 딜레이
-                time.sleep(1.5) 
+                # 조건 완화: RSI 45 이하 & 거래량 평소 대비 50% 이상 (하락장 거래량 마름 현상 반영)
+                if rsi_val <= 45.0 and vol_ratio >= 50.0:
+                    
+                    # 기술적 통과 종목만 수급 및 목표가 계산 (과도한 웹 크롤링 방지)
+                    investor_ok = check_investor_buying(code)
+                    target_price = calculate_target_price(df, current_price)
+                    
+                    upside_potential = ((target_price - current_price) / current_price) * 100.0
+                    
+                    # 5단계 세분화 평가
+                    stars, tier_label = get_signal_tier(rsi_val, vol_ratio, investor_ok, upside_potential, is_market_good)
+                    if not stars: continue 
+                    
+                    msg = (
+                        f"🚨 <b>[V5.1 시그널 포착!]</b> {stars}\n"
+                        f"<b>[강도: {tier_label}]</b>\n\n"
+                        f"📌 <b>종목명:</b> {name} ({code})\n"
+                        f"💰 <b>현재가:</b> {current_price:,}원\n"
+                        f"💎 <b>보수적 목표가:</b> {target_price:,}원 (상승여력 {upside_potential:+.1f}%)\n\n"
+                        f"📊 <b>[포착 근거]</b>\n"
+                        f"• <b>RSI:</b> {rsi_val:.1f} (바닥권 감시)\n"
+                        f"• <b>예상 환산 거래량:</b> 평소 대비 {vol_ratio:.1f}%\n"
+                        f"• <b>수급:</b> {'개미털기(외인기관매수)' if investor_ok else '보통'}\n\n"
+                        f"💡 <b>추천 명령어:</b>\n"
+                        f"• 단타 매수: <code>/매수 {name} {current_price} 단타</code>\n"
+                        f"• 스윙 매수: <code>/매수 {name} {current_price} 스윙</code>"
+                    )
+                    send_telegram_msg(msg)
+                    sent_signals_today[code] = {'name': name, 'time': now_kst}
+                    
+                    # 네이버 블락 방지를 위한 안전 딜레이
+                    time.sleep(1.5) 
+
+            except Exception as e:
+                # 개별 종목 데이터 크롤링 에러 발생 시 로그 (최초 1회만 받기 위해 break)
+                error_msg = f"⚠️ [데이터 수집 오류] {name}({code})\n{str(e)}"
+                send_telegram_msg(error_msg)
+                print(error_msg)
+                time.sleep(5) 
+                break # 에러가 한 번 나면 해당 주기 전체 스캔 중단 (IP 차단 확인용)
                 
     except Exception as e: 
-        print(f"전체 종목 스캔 중 심각한 에러 발생: {e}")
+        send_telegram_msg(f"🚨 [시스템 치명적 오류]\n전체 종목 스캔 중 에러 발생: {e}")
 
 def run_scanner():
     global morning_briefing_sent_date, daily_summary_sent_date
