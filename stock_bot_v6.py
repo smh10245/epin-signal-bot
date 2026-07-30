@@ -15,6 +15,7 @@ import requests
 import FinanceDataReader as fdr
 import yfinance as yf
 from flask import Flask, jsonify
+from dart_api import get_fair_value
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
