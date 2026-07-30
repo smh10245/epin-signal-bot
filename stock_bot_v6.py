@@ -20,15 +20,16 @@ from urllib3.util.retry import Retry
 
 
 # ============================================================
-# 뽕실로봇 V6 Ultimate
+# 뽕실로봇 V7 Ultimate
 # - Wilder RSI / EMA / MACD / ATR / ADX / Bollinger Band
 # - AI Score 100점
 # - 시가총액 상위 200종목
 # - 캐시 / 재시도 / 상태 명령어 / 강제 스캔
 # - ATR 기반 손절 및 트레일링
+# - 안전/일반/공격 추천모드
 # ============================================================
 
-APP_VERSION = "6.1.0"
+APP_VERSION = "7.0.0"
 KST = timezone(timedelta(hours=9))
 
 app = Flask(__name__)
@@ -44,6 +45,26 @@ SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
 PORTFOLIO_INTERVAL_SECONDS = int(os.getenv("PORTFOLIO_INTERVAL_SECONDS", "60"))
 COMMAND_INTERVAL_SECONDS = int(os.getenv("COMMAND_INTERVAL_SECONDS", "5"))
 MIN_AI_SCORE = float(os.getenv("MIN_AI_SCORE", "70"))
+MODE_FILE = os.getenv("MODE_FILE", "bot_mode.json")
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", "일반").strip()
+
+MODE_CONFIG: Dict[str, Dict[str, Any]] = {
+    "안전": {
+        "label": "안전모드",
+        "min_ai_score": float(os.getenv("SAFE_MODE_MIN_AI_SCORE", "85")),
+        "max_recommendations": int(os.getenv("SAFE_MODE_MAX_RECOMMENDATIONS", "2")),
+    },
+    "일반": {
+        "label": "일반모드",
+        "min_ai_score": float(os.getenv("NORMAL_MODE_MIN_AI_SCORE", str(MIN_AI_SCORE))),
+        "max_recommendations": int(os.getenv("NORMAL_MODE_MAX_RECOMMENDATIONS", "5")),
+    },
+    "공격": {
+        "label": "공격모드",
+        "min_ai_score": float(os.getenv("AGGRESSIVE_MODE_MIN_AI_SCORE", "65")),
+        "max_recommendations": int(os.getenv("AGGRESSIVE_MODE_MAX_RECOMMENDATIONS", "8")),
+    },
+}
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "3600"))
 DATA_CACHE_SECONDS = int(os.getenv("DATA_CACHE_SECONDS", "300"))
 LISTING_CACHE_SECONDS = int(os.getenv("LISTING_CACHE_SECONDS", "21600"))
@@ -76,11 +97,75 @@ runtime_state: Dict[str, Any] = {
     "today_analyzed_total": 0,
     "today_signal_total": 0,
     "today_best_score": None,
-    "today_best_v_score": None,
-    "last_error_at": None,
 }
 
 _cache: Dict[str, Tuple[float, Any]] = {}
+
+
+# ----------------------------- recommendation mode -----------------------------
+
+def normalize_mode_name(mode: str) -> Optional[str]:
+    value = str(mode or "").strip().replace("모드", "")
+    aliases = {
+        "safe": "안전",
+        "normal": "일반",
+        "aggressive": "공격",
+        "안전": "안전",
+        "일반": "일반",
+        "공격": "공격",
+    }
+    return aliases.get(value.lower(), aliases.get(value))
+
+
+def load_bot_mode() -> str:
+    default_mode = normalize_mode_name(DEFAULT_MODE) or "일반"
+    if not os.path.exists(MODE_FILE):
+        return default_mode
+    try:
+        with open(MODE_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        saved_mode = normalize_mode_name(data.get("mode") if isinstance(data, dict) else "")
+        return saved_mode or default_mode
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("추천모드 불러오기 실패: %s", exc)
+        return default_mode
+
+
+def save_bot_mode(mode: str) -> None:
+    normalized = normalize_mode_name(mode)
+    if not normalized:
+        raise ValueError("지원하지 않는 추천모드입니다.")
+    atomic_json_write(MODE_FILE, {
+        "mode": normalized,
+        "updated_at": get_kst_now().isoformat(),
+    })
+
+
+def get_mode_settings() -> Tuple[str, Dict[str, Any]]:
+    mode = load_bot_mode()
+    return mode, MODE_CONFIG[mode]
+
+
+def get_mode_min_ai_score() -> float:
+    return float(get_mode_settings()[1]["min_ai_score"])
+
+
+def get_mode_max_recommendations() -> int:
+    return int(get_mode_settings()[1]["max_recommendations"])
+
+
+def format_mode_status() -> str:
+    mode, config = get_mode_settings()
+    return (
+        f"🎛️ <b>[추천모드]</b>\n\n"
+        f"현재 추천모드: <b>{config['label']}</b>\n"
+        f"AI 점수 기준: <b>{float(config['min_ai_score']):.0f}점 이상</b>\n"
+        f"스캔당 추천 수: <b>최대 {int(config['max_recommendations'])}종목</b>\n\n"
+        f"변경 명령어\n"
+        f"• <code>/모드 안전</code>\n"
+        f"• <code>/모드 일반</code>\n"
+        f"• <code>/모드 공격</code>"
+    )
 
 
 # ----------------------------- logging -----------------------------
@@ -207,67 +292,35 @@ def save_portfolio(data: Dict[str, Any]) -> None:
         except OSError as exc:
             logger.error("포트폴리오 저장 실패: %s", exc)
 
-
-
 def load_signal_history() -> list[Dict[str, Any]]:
-    with state_lock:
-        if not os.path.exists(SIGNAL_HISTORY_FILE):
-            return []
-        try:
-            with open(SIGNAL_HISTORY_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-                return data if isinstance(data, list) else []
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.error("추천 이력 불러오기 실패: %s", exc)
-            return []
+    if not os.path.exists(SIGNAL_HISTORY_FILE):
+        return []
+    try:
+        with open(SIGNAL_HISTORY_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("시그널 기록 불러오기 실패: %s", exc)
+        return []
 
 
-def save_signal_history(history: list[Dict[str, Any]]) -> None:
-    with state_lock:
-        try:
-            temp_path = f"{SIGNAL_HISTORY_FILE}.tmp"
-            with open(temp_path, "w", encoding="utf-8") as file:
-                json.dump(history, file, ensure_ascii=False, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temp_path, SIGNAL_HISTORY_FILE)
-        except OSError as exc:
-            logger.error("추천 이력 저장 실패: %s", exc)
+def save_signal_history(data: list[Dict[str, Any]]) -> None:
+    temp_path = f"{SIGNAL_HISTORY_FILE}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, SIGNAL_HISTORY_FILE)
+    except OSError as exc:
+        logger.error("시그널 기록 저장 실패: %s", exc)
 
 
-def record_signal(
-    code: str,
-    name: str,
-    signal: "SignalResult",
-    market: Dict[str, Any],
-    now: datetime,
-) -> None:
+def append_signal_history(record: Dict[str, Any]) -> None:
     history = load_signal_history()
-    history.append(
-        {
-            "date": now.strftime("%Y-%m-%d"),
-            "time": now.isoformat(),
-            "code": code,
-            "name": name,
-            "recommend_price": signal.current_price,
-            "ai_score": signal.score,
-            "grade": signal.grade,
-            "v_score": signal.v_score,
-            "v_stage": signal.v_stage,
-            "target_price": signal.target_price,
-            "stop_price": signal.stop_price,
-            "market_score": market.get("score"),
-            "rsi": round(signal.rsi, 2),
-            "volume_ratio": round(signal.volume_ratio, 2),
-            "atr_percent": round(signal.atr_percent, 2),
-        }
-    )
+    history.append(record)
+    # 파일 과대화를 막기 위해 최근 5,000건 유지
     save_signal_history(history[-5000:])
-
-
-def get_today_history() -> list[Dict[str, Any]]:
-    today = get_kst_now().strftime("%Y-%m-%d")
-    return [item for item in load_signal_history() if item.get("date") == today]
 
 
 def split_telegram_message(message: str) -> list[str]:
@@ -610,7 +663,6 @@ def calculate_market_score(force: bool = False) -> Dict[str, Any]:
 
 # ----------------------------- AI score -----------------------------
 
-
 @dataclass
 class SignalResult:
     score: float
@@ -628,91 +680,62 @@ class SignalResult:
     macd_hist: float
     investor_ok: Optional[bool]
     v_score: float
-    v_stage: str
     v_reasons: list[str]
 
 
-def calculate_v_reversal_score(df: pd.DataFrame) -> Tuple[float, str, list[str]]:
-    if len(df) < 22:
-        return 0.0, "데이터 부족", []
+def calculate_v_reversal_score(df: pd.DataFrame) -> Tuple[float, list[str]]:
+    """기존 AI 점수와 분리된 V자 반등 보조 점수(0~10)."""
+    if len(df) < 3:
+        return 0.0, []
 
     row = df.iloc[-1]
     prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
-
-    close = safe_float(row["Close"])
-    open_price = safe_float(row["Open"], close)
-    high = safe_float(row["High"], close)
-    low = safe_float(row["Low"], close)
-    rsi = safe_float(row["RSI"], 50)
-    prev_rsi = safe_float(prev["RSI"], 50)
-    prev2_rsi = safe_float(prev2["RSI"], 50)
-    macd_hist = safe_float(row["MACD_HIST"])
-    prev_hist = safe_float(prev["MACD_HIST"])
-    ema20 = safe_float(row["EMA20"], close)
-    prev_ema20 = safe_float(prev["EMA20"], close)
-    bb_lower = safe_float(row["BB_LOWER"])
-    avg_volume = safe_float(prev["VOL_MA20"], 1)
-    volume_ratio = safe_float(row["Volume"]) / max(avg_volume, 1)
-
     score = 0.0
     reasons: list[str] = []
 
-    if prev_rsi < 35 <= rsi:
+    rsi = safe_float(row.get("RSI"), 50)
+    prev_rsi = safe_float(prev.get("RSI"), 50)
+    if prev_rsi < 35 <= rsi or (rsi <= 42 and rsi > prev_rsi):
         score += 2.0
-        reasons.append("RSI 과매도권 탈출")
-    elif rsi > prev_rsi > prev2_rsi and prev2_rsi <= 40:
-        score += 1.3
-        reasons.append("RSI 연속 회복")
+        reasons.append("RSI 과매도권 반등")
 
-    if macd_hist > prev_hist and prev_hist <= 0:
-        score += 1.8
-        reasons.append("MACD 하락 둔화·반전")
-    elif macd_hist > prev_hist:
-        score += 0.8
+    macd_hist = safe_float(row.get("MACD_HIST"))
+    prev_macd_hist = safe_float(prev.get("MACD_HIST"))
+    if macd_hist > prev_macd_hist:
+        score += 2.0
+        reasons.append("MACD 모멘텀 개선")
 
-    if volume_ratio >= 1.5:
-        score += 1.5
-        reasons.append("거래량 150% 이상")
-    elif volume_ratio >= 1.15:
-        score += 0.8
+    avg_volume = max(safe_float(prev.get("VOL_MA20"), 1), 1)
+    volume_ratio = safe_float(row.get("Volume")) / avg_volume * 100
+    if volume_ratio >= 120:
+        score += 2.0
         reasons.append("거래량 증가")
+    elif volume_ratio >= 90:
+        score += 1.0
 
-    candle_range = max(high - low, 1)
-    lower_wick = min(open_price, close) - low
-    recovery = (close - low) / candle_range
-    if lower_wick / candle_range >= 0.35 and close >= open_price:
-        score += 1.5
-        reasons.append("긴 아랫꼬리·양봉 회복")
-    elif recovery >= 0.65:
-        score += 0.8
-        reasons.append("저점 대비 강한 회복")
+    high = safe_float(row.get("High"))
+    low = safe_float(row.get("Low"))
+    close = safe_float(row.get("Close"))
+    open_price = safe_float(row.get("Open"), close)
+    candle_range = max(high - low, 0)
+    if candle_range > 0:
+        lower_wick = min(open_price, close) - low
+        recovery = (close - low) / candle_range
+        if lower_wick / candle_range >= 0.35:
+            score += 2.0
+            reasons.append("긴 아랫꼬리")
+        if recovery >= 0.70:
+            score += 1.0
+            reasons.append("저점 대비 강한 회복")
 
-    prev_close = safe_float(prev["Close"])
-    if prev_close < prev_ema20 and close >= ema20:
-        score += 1.5
+    ema20 = safe_float(row.get("EMA20"))
+    prev_close = safe_float(prev.get("Close"))
+    if ema20 > 0 and prev_close < ema20 <= close:
+        score += 1.0
         reasons.append("EMA20 재돌파")
-    elif close >= ema20 * 0.99:
-        score += 0.5
 
-    prev_bb_lower = safe_float(prev["BB_LOWER"])
-    if prev_bb_lower > 0 and prev_close < prev_bb_lower and close >= bb_lower:
-        score += 1.2
-        reasons.append("볼린저 하단 복귀")
-    elif bb_lower > 0 and close <= bb_lower * 1.02:
-        score += 0.5
+    return round(min(score, 10.0), 1), reasons[:5]
 
-    score = round(min(10.0, max(0.0, score)), 1)
-    if score >= 8:
-        stage = "강한 초기 반등"
-    elif score >= 6:
-        stage = "초기 반등"
-    elif score >= 4:
-        stage = "반등 관찰"
-    else:
-        stage = "확인 필요"
-
-    return score, stage, reasons
 
 def calculate_ai_score(
     df: pd.DataFrame,
@@ -734,6 +757,7 @@ def calculate_ai_score(
     estimated_volume = get_estimated_daily_volume(safe_float(row["Volume"]), now)
     volume_ratio = estimated_volume / max(avg_volume, 1) * 100
     atr_percent = atr / close * 100 if close > 0 else 0
+    v_score, v_reasons = calculate_v_reversal_score(df)
 
     score = 0.0
     reasons: list[str] = []
@@ -853,7 +877,6 @@ def calculate_ai_score(
         warnings.append("최근 5일 낙폭 과대")
 
     score = round(max(0, min(100, score)), 1)
-    v_score, v_stage, v_reasons = calculate_v_reversal_score(df)
 
     if score >= 85:
         grade = "S"
@@ -891,7 +914,6 @@ def calculate_ai_score(
         macd_hist=macd_hist,
         investor_ok=investor_ok,
         v_score=v_score,
-        v_stage=v_stage,
         v_reasons=v_reasons,
     )
 
@@ -912,7 +934,6 @@ def analyze_stock(
     return df, signal, market
 
 
-
 def format_signal_message(
     code: str,
     name: str,
@@ -921,22 +942,25 @@ def format_signal_message(
 ) -> str:
     reasons = "\n".join(f"• {html.escape(item)}" for item in signal.reasons[:6])
     warnings = "\n".join(f"• {html.escape(item)}" for item in signal.warnings[:4])
-    v_reasons = "\n".join(f"• {html.escape(item)}" for item in signal.v_reasons[:5])
 
     message = (
-        f"🚨 <b>[뽕실로봇 V{APP_VERSION} 매수 후보]</b>\n"
+        f"🚨 <b>[뽕실로봇 V7 매수 후보]</b>\n"
         f"🧠 <b>AI 점수 {signal.score:.1f}/100 · {signal.grade}등급</b>\n"
-        f"📈 <b>V반등 {signal.v_score:.1f}/10 · {html.escape(signal.v_stage)}</b>\n\n"
+        f"🔻 <b>V반등 점수 {signal.v_score:.1f}/10</b>\n\n"
         f"📌 <b>{html.escape(name)}</b> ({code})\n"
         f"💰 현재가: <b>{signal.current_price:,}원</b>\n"
-        f"🎯 1차 목표가: <b>{signal.target_price:,}원</b> ({signal.upside:+.1f}%)\n"
+        f"🎯 1차 목표가: <b>{signal.target_price:,}원</b> "
+        f"({signal.upside:+.1f}%)\n"
         f"🛑 참고 손절가: <b>{signal.stop_price:,}원</b>\n\n"
         f"📊 RSI {signal.rsi:.1f} · ADX {signal.adx:.1f}\n"
-        f"📈 예상 거래량 {signal.volume_ratio:.0f}% · ATR {signal.atr_percent:.1f}%\n"
+        f"📈 예상 거래량 {signal.volume_ratio:.0f}% · "
+        f"ATR {signal.atr_percent:.1f}%\n"
         f"🌏 시장강도 {market['score']:.1f}점 ({html.escape(market['detail'])})\n\n"
-        f"<b>[AI 가점 근거]</b>\n{reasons or '• 뚜렷한 가점 근거 없음'}\n\n"
-        f"<b>[V반등 근거]</b>\n{v_reasons or '• 뚜렷한 V반등 근거 없음'}"
+        f"<b>[가점 근거]</b>\n{reasons or '• 뚜렷한 가점 근거 없음'}"
     )
+    if signal.v_reasons:
+        v_text = "\n".join(f"• {html.escape(item)}" for item in signal.v_reasons)
+        message += f"\n\n🔻 <b>[V반등 근거]</b>\n{v_text}"
     if warnings:
         message += f"\n\n⚠️ <b>[주의]</b>\n{warnings}"
 
@@ -944,29 +968,32 @@ def format_signal_message(
         f"\n\n💡 등록 명령어\n"
         f"• <code>/매수 {html.escape(name)} {signal.current_price} 단타</code>\n"
         f"• <code>/매수 {html.escape(name)} {signal.current_price} 스윙</code>\n\n"
-        f"<i>AI·V반등 점수는 참고값이며 수익을 보장하지 않습니다.</i>"
+        f"<i>AI 점수는 기술적 조건을 정량화한 참고값이며 수익을 보장하지 않습니다.</i>"
     )
     return message
 
+
 # ----------------------------- portfolio -----------------------------
 
-
 def get_trade_rules(trade_type: str, atr_percent: float) -> Dict[str, float]:
+    """ATR를 반영하되 손절 폭에 명확한 상한을 둡니다."""
     atr_percent = max(0.8, min(atr_percent, 8.0))
+
     if trade_type == "스윙":
-        stop_abs = min(8.0, max(4.0, atr_percent * 1.35))
+        stop_abs = min(max(4.0, atr_percent * 1.25), 8.0)
         return {
             "trigger": max(4.0, atr_percent * 1.35),
             "trailing": max(2.0, atr_percent * 0.75),
             "stop": -stop_abs,
         }
 
-    stop_abs = min(5.5, max(2.5, atr_percent * 1.05))
+    stop_abs = min(max(2.5, atr_percent * 1.0), 5.5)
     return {
         "trigger": max(2.0, atr_percent * 0.85),
         "trailing": max(1.0, atr_percent * 0.50),
         "stop": -stop_abs,
     }
+
 
 def monitor_portfolio() -> None:
     portfolio = load_portfolio()
@@ -1083,7 +1110,7 @@ def run_backtest(code: str, name: str) -> str:
                     if hasattr(df.index[index], "to_pydatetime")
                     else get_kst_now(),
                 )
-                if signal.score >= MIN_AI_SCORE:
+                if signal.score >= get_mode_min_ai_score():
                     position = {
                         "buy": next_open,
                         "max": next_open,
@@ -1115,7 +1142,7 @@ def run_backtest(code: str, name: str) -> str:
 
         if not trades:
             return (
-                f"📊 <b>[{html.escape(name)}] V6 백테스트</b>\n"
+                f"📊 <b>[{html.escape(name)}] V7 백테스트</b>\n"
                 f"조건에 맞는 완료 거래가 없습니다."
             )
 
@@ -1133,7 +1160,7 @@ def run_backtest(code: str, name: str) -> str:
         )
 
         return (
-            f"📊 <b>[{html.escape(name)}] V6 백테스트</b>\n"
+            f"📊 <b>[{html.escape(name)}] V7 백테스트</b>\n"
             f"<i>약 2년 · 다음 날 시가 진입 · 거래비용 0.30% 반영</i>\n\n"
             f"총 거래: {len(trades)}회\n"
             f"승률: <b>{win_rate:.1f}%</b>\n"
@@ -1173,11 +1200,6 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
         with state_lock:
             if last_reset_date != today:
                 sent_signals_today.clear()
-                runtime_state["today_scan_runs"] = 0
-                runtime_state["today_analyzed_total"] = 0
-                runtime_state["today_signal_total"] = 0
-                runtime_state["today_best_score"] = None
-                runtime_state["today_best_v_score"] = None
                 last_reset_date = today
 
         market = calculate_market_score(force=force)
@@ -1217,7 +1239,8 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
                 )
                 scanned += 1
 
-                if preliminary.score < MIN_AI_SCORE - 5:
+                mode_min_score = get_mode_min_ai_score()
+                if preliminary.score < mode_min_score - 5:
                     continue
 
                 investor_ok = check_investor_buying(code)
@@ -1228,7 +1251,7 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
                     now=now,
                 )
 
-                if signal.score >= MIN_AI_SCORE:
+                if signal.score >= mode_min_score:
                     candidates.append((signal.score, code, name, signal))
 
             except Exception as exc:
@@ -1239,7 +1262,10 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
         candidates.sort(key=lambda item: item[0], reverse=True)
 
         # 한 번의 스캔에서 최대 10개만 전송해 알림 폭주 방지
-        for _, code, name, signal in candidates[:10]:
+        mode, mode_config = get_mode_settings()
+        max_recommendations = int(mode_config["max_recommendations"])
+
+        for _, code, name, signal in candidates[:max_recommendations]:
             send_telegram_msg(
                 format_signal_message(code, name, signal, market),
                 requested_chat_id,
@@ -1249,13 +1275,24 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
                     "name": name,
                     "time": now,
                     "score": signal.score,
-                    "v_score": signal.v_score,
                     "price": signal.current_price,
                     "target_price": signal.target_price,
                     "stop_price": signal.stop_price,
-                    "code": code,
+                    "v_score": signal.v_score,
                 }
-            record_signal(code, name, signal, market, now)
+            append_signal_history({
+                "date": today,
+                "time": now.isoformat(),
+                "code": code,
+                "name": name,
+                "price": signal.current_price,
+                "score": signal.score,
+                "grade": signal.grade,
+                "v_score": signal.v_score,
+                "target_price": signal.target_price,
+                "stop_price": signal.stop_price,
+                "market_score": market.get("score"),
+            })
             signal_count += 1
             time.sleep(0.6)
 
@@ -1266,18 +1303,15 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
         runtime_state["today_analyzed_total"] += scanned
         runtime_state["today_signal_total"] += signal_count
         if candidates:
-            best = candidates[0][3]
-            runtime_state["today_best_score"] = max(
-                safe_float(runtime_state.get("today_best_score")), best.score
-            )
-            runtime_state["today_best_v_score"] = max(
-                safe_float(runtime_state.get("today_best_v_score")), best.v_score
-            )
+            best = max(item[0] for item in candidates)
+            current_best = runtime_state.get("today_best_score")
+            runtime_state["today_best_score"] = best if current_best is None else max(current_best, best)
 
         if requested_chat_id:
             send_telegram_msg(
                 f"✅ 강제 스캔 완료\n"
-                f"분석 {scanned}종목 · 기준 {MIN_AI_SCORE:.0f}점 이상 "
+                f"분석 {scanned}종목 · {mode_config['label']} 기준 "
+                f"{float(mode_config['min_ai_score']):.0f}점 이상 "
                 f"{signal_count}종목 전송",
                 requested_chat_id,
             )
@@ -1291,7 +1325,6 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
 
     except Exception as exc:
         runtime_state["last_scan_error"] = str(exc)
-        runtime_state["last_error_at"] = get_kst_now().isoformat()
         logger.exception("전체 스캔 실패")
         if requested_chat_id:
             send_telegram_msg(
@@ -1307,7 +1340,7 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
 
 def command_help() -> str:
     return (
-        "🤖 <b>[뽕실로봇 V6 명령어]</b>\n\n"
+        "🤖 <b>[뽕실로봇 V7 명령어]</b>\n\n"
         "• <code>/매수 종목명 단가 단타</code>\n"
         "• <code>/매수 종목명 단가 스윙</code>\n"
         "• <code>/수정 종목명 단가 단타</code>\n"
@@ -1318,6 +1351,10 @@ def command_help() -> str:
         "• <code>/시장</code>\n"
         "• <code>/상태</code>\n"
         "• <code>/강제스캔</code>\n"
+        "• <code>/모드</code>\n"
+        "• <code>/모드 안전</code>\n"
+        "• <code>/모드 일반</code>\n"
+        "• <code>/모드 공격</code>\n"
         "• <code>/도움말</code>"
     )
 
@@ -1381,46 +1418,32 @@ def handle_command(text: str, chat_id: str) -> None:
 
         lines = ["📂 <b>[보유·감시 목록]</b>"]
         for name, info in portfolio.items():
-            code = str(info.get("code", "")).zfill(6)
             buy_price = safe_float(info.get("price"))
             trade_type = info.get("type", "단타")
             status = "트레일링 가동" if info.get("trailing_active") else "일반 감시"
-
             try:
-                df = add_indicators(get_price_data(code, 80, force=True))
+                code = str(info.get("code", "")).zfill(6)
+                df = add_indicators(get_price_data(code, 80))
                 row = df.iloc[-1]
                 current_price = int(row["Close"])
                 atr_percent = safe_float(row["ATR"]) / max(current_price, 1) * 100
                 rules = get_trade_rules(trade_type, atr_percent)
-                profit_rate = (current_price - buy_price) / buy_price * 100
+                profit_rate = (current_price - buy_price) / buy_price * 100 if buy_price else 0
                 stop_price = int(buy_price * (1 + rules["stop"] / 100))
                 trigger_price = int(buy_price * (1 + rules["trigger"] / 100))
-                max_price = int(safe_float(info.get("max_price"), buy_price))
-
-                lines.extend(
-                    [
-                        "",
-                        f"📌 <b>{html.escape(name)}</b> ({trade_type})",
-                        f"매수가: {int(buy_price):,}원",
-                        f"현재가: {current_price:,}원",
-                        f"수익률: <b>{profit_rate:+.2f}%</b>",
-                        f"손절가: {stop_price:,}원 ({rules['stop']:.1f}%)",
-                        f"트레일링 시작가: {trigger_price:,}원 (+{rules['trigger']:.1f}%)",
-                        f"최고가: {max_price:,}원",
-                        f"상태: {status}",
-                    ]
+                lines.append(
+                    f"\n• <b>{html.escape(name)}</b> ({trade_type})\n"
+                    f"  매수가 {int(buy_price):,}원 · 현재가 {current_price:,}원\n"
+                    f"  수익률 <b>{profit_rate:+.2f}%</b>\n"
+                    f"  손절가 {stop_price:,}원 · 트레일링 시작 {trigger_price:,}원\n"
+                    f"  상태: {status}"
                 )
             except Exception:
-                lines.extend(
-                    [
-                        "",
-                        f"📌 <b>{html.escape(name)}</b> ({trade_type})",
-                        f"매수가: {int(buy_price):,}원",
-                        "현재가: 확인 불가",
-                        f"상태: {status}",
-                    ]
+                lines.append(
+                    f"\n• <b>{html.escape(name)}</b> ({trade_type})\n"
+                    f"  매수가 {int(buy_price):,}원 · 현재가 확인 불가\n"
+                    f"  상태: {status}"
                 )
-
         send_telegram_msg("\n".join(lines), chat_id)
 
     elif cmd == "/점수":
@@ -1452,6 +1475,35 @@ def handle_command(text: str, chat_id: str) -> None:
         send_telegram_msg(f"⏳ {html.escape(name)} 백테스트 중...", chat_id)
         send_telegram_msg(run_backtest(code, name), chat_id)
 
+    elif cmd == "/모드":
+        if len(parts) == 1:
+            send_telegram_msg(format_mode_status(), chat_id)
+            return
+
+        requested_mode = normalize_mode_name(parts[1])
+        if not requested_mode:
+            send_telegram_msg(
+                "⚠️ 사용법: /모드 [안전/일반/공격]",
+                chat_id,
+            )
+            return
+
+        try:
+            save_bot_mode(requested_mode)
+            config = MODE_CONFIG[requested_mode]
+            send_telegram_msg(
+                f"✅ 추천모드를 <b>{config['label']}</b>로 변경했습니다.\n"
+                f"AI 점수 기준: {float(config['min_ai_score']):.0f}점 이상\n"
+                f"스캔당 추천 수: 최대 {int(config['max_recommendations'])}종목",
+                chat_id,
+            )
+        except Exception as exc:
+            logger.exception("추천모드 저장 실패")
+            send_telegram_msg(
+                f"⚠️ 추천모드 변경 실패: {html.escape(str(exc))}",
+                chat_id,
+            )
+
     elif cmd == "/시장":
         market = calculate_market_score(force=True)
         send_telegram_msg(
@@ -1463,27 +1515,27 @@ def handle_command(text: str, chat_id: str) -> None:
         )
 
     elif cmd == "/상태":
-        started = datetime.fromisoformat(runtime_state["started_at"]).replace(tzinfo=None)
-        uptime = get_kst_now() - started
+        started = datetime.fromisoformat(runtime_state["started_at"])
+        uptime = datetime.now(KST) - started
         hours, remainder = divmod(int(uptime.total_seconds()), 3600)
         minutes = remainder // 60
-        today_history = get_today_history()
-
         send_telegram_msg(
             f"🛠️ <b>[뽕실로봇 V{APP_VERSION} 상태]</b>\n\n"
             f"스캐너: {'가동 중' if runtime_state['scanner_running'] else '대기'}\n"
+            f"추천모드: {get_mode_settings()[1]['label']}\n"
+            f"추천기준: {get_mode_min_ai_score():.0f}점 이상 · 최대 {get_mode_max_recommendations()}종목\n"
             f"가동시간: {hours}시간 {minutes}분\n"
             f"마지막 스캔: {runtime_state['last_scan_at'] or '없음'}\n"
             f"최근 분석: {runtime_state['last_scan_count']}종목\n"
-            f"최근 시그널: {runtime_state['last_signal_count']}종목\n\n"
+            f"최근 시그널: {runtime_state['last_signal_count']}종목\n"
             f"오늘 스캔: {runtime_state['today_scan_runs']}회\n"
             f"오늘 누적 분석: {runtime_state['today_analyzed_total']}종목\n"
-            f"오늘 누적 추천: {len(today_history)}건\n"
-            f"오늘 최고 AI: {runtime_state['today_best_score'] if runtime_state['today_best_score'] is not None else '없음'}\n"
-            f"오늘 최고 V반등: {runtime_state['today_best_v_score'] if runtime_state['today_best_v_score'] is not None else '없음'}\n"
-            f"감시 종목: {len(portfolio)}개\n"
+            f"오늘 누적 시그널: {runtime_state['today_signal_total']}종목\n"
+            f"오늘 최고 AI점수: {runtime_state['today_best_score'] or '없음'}\n"
+            f"감시 종목: {len(portfolio)}종목\n"
             f"시장점수: {runtime_state['market_score'] or '미계산'}\n"
-            f"마지막 오류: {html.escape(str(runtime_state['last_scan_error'] or '없음'))}",
+            f"기록파일: {html.escape(SIGNAL_HISTORY_FILE)}\n"
+            f"오류: {html.escape(str(runtime_state['last_scan_error'] or '없음'))}",
             chat_id,
         )
 
@@ -1540,7 +1592,7 @@ def send_morning_briefing() -> None:
         "애플": "AAPL",
     }
     lines = [
-        f"🌅 <b>[뽕실로봇 V6 장전 브리핑]</b>",
+        f"🌅 <b>[뽕실로봇 V7 장전 브리핑]</b>",
         get_kst_now().strftime("%Y-%m-%d"),
         "",
     ]
@@ -1566,81 +1618,69 @@ def send_morning_briefing() -> None:
     send_telegram_msg("\n".join(lines))
 
 
-
 def send_daily_closing_report() -> None:
     now = get_kst_now()
-    signals = get_today_history()
+    today = now.strftime("%Y-%m-%d")
+    history = [item for item in load_signal_history() if item.get("date") == today]
 
-    if not signals:
-        send_telegram_msg(
-            f"📋 <b>[{now:%Y-%m-%d} 장 마감]</b>\n\n"
-            f"오늘 AI 점수 {MIN_AI_SCORE:.0f}점 이상 시그널이 없었습니다."
+    if not history:
+        message = (
+            f"📋 <b>[{today} 장 마감]</b>\n\n"
+            f"오늘 {get_mode_settings()[1]['label']} 기준 "
+            f"AI 점수 {get_mode_min_ai_score():.0f}점 이상 시그널이 없었습니다.\n"
+            f"누적 분석: {runtime_state['today_analyzed_total']}종목"
         )
+        send_telegram_msg(message)
         return
 
-    results = []
-    for item in signals:
+    evaluated = []
+    for item in history:
         try:
             df = get_price_data(str(item["code"]).zfill(6), 10, force=True)
-            today_rows = df[df.index.strftime("%Y-%m-%d") == now.strftime("%Y-%m-%d")]
-            row = today_rows.iloc[-1] if not today_rows.empty else df.iloc[-1]
-            recommendation = safe_float(item.get("recommend_price"))
+            row = df.iloc[-1]
+            entry = safe_float(item.get("price"))
             high = safe_float(row["High"])
             low = safe_float(row["Low"])
             close = safe_float(row["Close"])
-            max_return = (high - recommendation) / recommendation * 100
-            max_loss = (low - recommendation) / recommendation * 100
-            close_return = (close - recommendation) / recommendation * 100
-            results.append(
-                {
-                    **item,
-                    "close_price": int(close),
-                    "close_return": close_return,
-                    "max_return": max_return,
-                    "max_loss": max_loss,
-                    "target_hit": high >= safe_float(item.get("target_price")),
-                    "stop_hit": low <= safe_float(item.get("stop_price")),
-                }
-            )
+            evaluated.append({
+                **item,
+                "close": close,
+                "return": (close - entry) / entry * 100 if entry else 0,
+                "max_return": (high - entry) / entry * 100 if entry else 0,
+                "max_loss": (low - entry) / entry * 100 if entry else 0,
+                "target_hit": high >= safe_float(item.get("target_price"), float("inf")),
+                "stop_hit": low <= safe_float(item.get("stop_price"), 0),
+            })
         except Exception as exc:
-            logger.info("장마감 성과 확인 실패 %s: %s", item.get("name"), exc)
+            logger.info("[%s] 장마감 성과 계산 실패: %s", item.get("name"), exc)
 
-    if not results:
-        send_telegram_msg(
-            f"📋 <b>[{now:%Y-%m-%d} 장 마감]</b>\n\n"
-            f"추천 {len(signals)}건이 있었으나 종가 성과를 확인하지 못했습니다."
-        )
+    if not evaluated:
+        send_telegram_msg(f"📋 <b>[{today} 장 마감]</b>\n\n추천 기록은 있으나 성과 계산에 실패했습니다.")
         return
 
-    avg_return = float(np.mean([item["close_return"] for item in results]))
-    winners = [item for item in results if item["close_return"] > 0]
-    best = max(results, key=lambda item: item["close_return"])
-    worst = min(results, key=lambda item: item["close_return"])
-    target_count = sum(bool(item["target_hit"]) for item in results)
-    stop_count = sum(bool(item["stop_hit"]) for item in results)
-
+    avg_return = float(np.mean([x["return"] for x in evaluated]))
+    winners = sum(1 for x in evaluated if x["return"] > 0)
+    best = max(evaluated, key=lambda x: x["return"])
+    worst = min(evaluated, key=lambda x: x["return"])
+    target_hits = sum(1 for x in evaluated if x["target_hit"])
+    stop_hits = sum(1 for x in evaluated if x["stop_hit"])
     rows = "\n".join(
-        f"• {html.escape(item['name'])}: "
-        f"{item['recommend_price']:,}→{item['close_price']:,}원 "
-        f"({item['close_return']:+.2f}%) · "
-        f"AI {item['ai_score']:.1f} · V {item.get('v_score', 0):.1f}"
-        for item in sorted(results, key=lambda x: x["close_return"], reverse=True)[:15]
+        f"• {html.escape(x['name'])}: {x['return']:+.2f}% "
+        f"(최대 {x['max_return']:+.2f}% / 최저 {x['max_loss']:+.2f}%)"
+        for x in evaluated[:15]
     )
+    message = (
+        f"📋 <b>[{today} 장 마감 브리핑]</b>\n\n"
+        f"분석 누적: <b>{runtime_state['today_analyzed_total']}종목</b>\n"
+        f"추천: <b>{len(evaluated)}종목</b> · 상승 {winners} · 하락 {len(evaluated)-winners}\n"
+        f"평균 수익률: <b>{avg_return:+.2f}%</b>\n"
+        f"목표가 도달: {target_hits} · 손절가 도달: {stop_hits}\n"
+        f"최고: {html.escape(best['name'])} {best['return']:+.2f}%\n"
+        f"최저: {html.escape(worst['name'])} {worst['return']:+.2f}%\n\n"
+        f"<b>[종목별 성과]</b>\n{rows}"
+    )
+    send_telegram_msg(message)
 
-    send_telegram_msg(
-        f"📋 <b>[{now:%Y-%m-%d} 장마감 성과]</b>\n\n"
-        f"분석 누적: {runtime_state['today_analyzed_total']}종목\n"
-        f"추천: <b>{len(results)}건</b>\n"
-        f"상승 {len(winners)} · 하락 {len(results) - len(winners)}\n"
-        f"종가 평균: <b>{avg_return:+.2f}%</b>\n"
-        f"종가 성공률: <b>{len(winners) / len(results) * 100:.1f}%</b>\n"
-        f"목표가 도달: {target_count}건\n"
-        f"손절가 도달: {stop_count}건\n"
-        f"최고: {html.escape(best['name'])} {best['close_return']:+.2f}%\n"
-        f"최저: {html.escape(worst['name'])} {worst['close_return']:+.2f}%\n"
-        f"시장점수: {runtime_state['market_score'] or '미계산'}\n\n"
-        f"<b>[추천별 종가 성적]</b>\n{rows}"
-    )
 
 # ----------------------------- scheduler -----------------------------
 
@@ -1751,8 +1791,9 @@ def health_json():
             "version": APP_VERSION,
             "runtime": runtime_state,
             "portfolio_count": len(load_portfolio()),
-            "signal_history_count": len(load_signal_history()),
             "time_kst": get_kst_now().isoformat(),
+            "recommendation_mode": get_mode_settings()[0],
+            "mode_config": get_mode_settings()[1],
         }
     )
 
