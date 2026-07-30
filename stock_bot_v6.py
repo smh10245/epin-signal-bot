@@ -29,7 +29,7 @@ from urllib3.util.retry import Retry
 # - 안전/일반/공격 추천모드
 # ============================================================
 
-APP_VERSION = "7.0.0"
+APP_VERSION = "7.1.0"
 KST = timezone(timedelta(hours=9))
 
 app = Flask(__name__)
@@ -39,6 +39,7 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 PORTFOLIO_FILE = os.getenv("PORTFOLIO_FILE", "portfolio.json")
 LOG_FILE = os.getenv("LOG_FILE", "stock_bot.log")
 SIGNAL_HISTORY_FILE = os.getenv("SIGNAL_HISTORY_FILE", "signal_history.json")
+SCHEDULER_STATE_FILE = os.getenv("SCHEDULER_STATE_FILE", "scheduler_state.json")
 
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "200"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
@@ -97,6 +98,11 @@ runtime_state: Dict[str, Any] = {
     "today_analyzed_total": 0,
     "today_signal_total": 0,
     "today_best_score": None,
+    "today_best_name": None,
+    "last_report_at": None,
+    "last_report_status": "미전송",
+    "last_telegram_error": None,
+    "last_candidate_count": 0,
 }
 
 _cache: Dict[str, Tuple[float, Any]] = {}
@@ -272,6 +278,27 @@ def atomic_json_write(path: str, data: Dict[str, Any]) -> None:
     os.replace(temp_path, path)
 
 
+def load_scheduler_state() -> Dict[str, Any]:
+    if not os.path.exists(SCHEDULER_STATE_FILE):
+        return {}
+    try:
+        with open(SCHEDULER_STATE_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("스케줄러 상태 불러오기 실패: %s", exc)
+        return {}
+
+
+def save_scheduler_state(**updates: Any) -> None:
+    try:
+        state = load_scheduler_state()
+        state.update(updates)
+        atomic_json_write(SCHEDULER_STATE_FILE, state)
+    except OSError as exc:
+        logger.warning("스케줄러 상태 저장 실패: %s", exc)
+
+
 def load_portfolio() -> Dict[str, Any]:
     with portfolio_lock:
         if not os.path.exists(PORTFOLIO_FILE):
@@ -362,8 +389,17 @@ def send_telegram_msg(message: str, chat_id: Optional[str] = None) -> bool:
             )
             response.raise_for_status()
         except requests.RequestException as exc:
-            logger.error("텔레그램 전송 실패: %s", exc)
+            detail = str(exc)
+            try:
+                if 'response' in locals() and response is not None:
+                    detail = f"{detail} | 응답: {response.text[:500]}"
+            except Exception:
+                pass
+            runtime_state["last_telegram_error"] = detail
+            logger.error("텔레그램 전송 실패: %s", detail)
             success = False
+    if success:
+        runtime_state["last_telegram_error"] = None
     return success
 
 
@@ -972,7 +1008,6 @@ def format_signal_message(
     )
     return message
 
-
 # ----------------------------- portfolio -----------------------------
 
 def get_trade_rules(trade_type: str, atr_percent: float) -> Dict[str, float]:
@@ -1200,6 +1235,11 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
         with state_lock:
             if last_reset_date != today:
                 sent_signals_today.clear()
+                runtime_state["today_scan_runs"] = 0
+                runtime_state["today_analyzed_total"] = 0
+                runtime_state["today_signal_total"] = 0
+                runtime_state["today_best_score"] = None
+                runtime_state["today_best_name"] = None
                 last_reset_date = today
 
         market = calculate_market_score(force=force)
@@ -1265,11 +1305,16 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
         mode, mode_config = get_mode_settings()
         max_recommendations = int(mode_config["max_recommendations"])
 
+        runtime_state["last_candidate_count"] = len(candidates)
+
         for _, code, name, signal in candidates[:max_recommendations]:
-            send_telegram_msg(
+            delivered = send_telegram_msg(
                 format_signal_message(code, name, signal, market),
                 requested_chat_id,
             )
+            if not delivered:
+                logger.warning("[%s %s] 추천 시그널 전송 실패 - 기록 및 쿨다운 제외", name, code)
+                continue
             with state_lock:
                 sent_signals_today[code] = {
                     "name": name,
@@ -1303,9 +1348,12 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
         runtime_state["today_analyzed_total"] += scanned
         runtime_state["today_signal_total"] += signal_count
         if candidates:
-            best = max(item[0] for item in candidates)
+            best_item = max(candidates, key=lambda item: item[0])
+            best = best_item[0]
             current_best = runtime_state.get("today_best_score")
-            runtime_state["today_best_score"] = best if current_best is None else max(current_best, best)
+            if current_best is None or best > current_best:
+                runtime_state["today_best_score"] = best
+                runtime_state["today_best_name"] = best_item[2]
 
         if requested_chat_id:
             send_telegram_msg(
@@ -1351,6 +1399,7 @@ def command_help() -> str:
         "• <code>/시장</code>\n"
         "• <code>/상태</code>\n"
         "• <code>/강제스캔</code>\n"
+        "• <code>/마감브리핑</code>\n"
         "• <code>/모드</code>\n"
         "• <code>/모드 안전</code>\n"
         "• <code>/모드 일반</code>\n"
@@ -1527,15 +1576,20 @@ def handle_command(text: str, chat_id: str) -> None:
             f"가동시간: {hours}시간 {minutes}분\n"
             f"마지막 스캔: {runtime_state['last_scan_at'] or '없음'}\n"
             f"최근 분석: {runtime_state['last_scan_count']}종목\n"
-            f"최근 시그널: {runtime_state['last_signal_count']}종목\n"
+            f"최근 후보: {runtime_state['last_candidate_count']}종목\n"
+            f"최근 전송 시그널: {runtime_state['last_signal_count']}종목\n"
             f"오늘 스캔: {runtime_state['today_scan_runs']}회\n"
             f"오늘 누적 분석: {runtime_state['today_analyzed_total']}종목\n"
             f"오늘 누적 시그널: {runtime_state['today_signal_total']}종목\n"
-            f"오늘 최고 AI점수: {runtime_state['today_best_score'] or '없음'}\n"
+            f"오늘 최고 AI점수: {runtime_state['today_best_score'] or '없음'}"
+            f" ({runtime_state['today_best_name'] or '-'})\n"
             f"감시 종목: {len(portfolio)}종목\n"
             f"시장점수: {runtime_state['market_score'] or '미계산'}\n"
+            f"장마감 브리핑: {runtime_state['last_report_status']}\n"
+            f"마지막 브리핑: {runtime_state['last_report_at'] or '없음'}\n"
+            f"텔레그램 오류: {html.escape(str(runtime_state['last_telegram_error'] or '없음'))}\n"
             f"기록파일: {html.escape(SIGNAL_HISTORY_FILE)}\n"
-            f"오류: {html.escape(str(runtime_state['last_scan_error'] or '없음'))}",
+            f"스캔 오류: {html.escape(str(runtime_state['last_scan_error'] or '없음'))}",
             chat_id,
         )
 
@@ -1546,6 +1600,15 @@ def handle_command(text: str, chat_id: str) -> None:
             kwargs={"force": True, "requested_chat_id": chat_id},
             daemon=True,
             name="manual-scan",
+        ).start()
+
+    elif cmd == "/마감브리핑":
+        send_telegram_msg("⏳ 장마감 브리핑을 계산 중입니다.", chat_id)
+        threading.Thread(
+            target=send_daily_closing_report,
+            kwargs={"chat_id": chat_id},
+            daemon=True,
+            name="manual-closing-report",
         ).start()
 
     elif cmd in ("/도움말", "/start"):
@@ -1583,7 +1646,7 @@ def process_telegram_commands() -> None:
 
 # ----------------------------- reports -----------------------------
 
-def send_morning_briefing() -> None:
+def send_morning_briefing() -> bool:
     tickers = {
         "나스닥": "^IXIC",
         "필라델피아 반도체": "^SOX",
@@ -1615,10 +1678,10 @@ def send_morning_briefing() -> None:
     except Exception:
         pass
 
-    send_telegram_msg("\n".join(lines))
+    return send_telegram_msg("\n".join(lines))
 
 
-def send_daily_closing_report() -> None:
+def send_daily_closing_report(chat_id: Optional[str] = None) -> bool:
     now = get_kst_now()
     today = now.strftime("%Y-%m-%d")
     history = [item for item in load_signal_history() if item.get("date") == today]
@@ -1630,8 +1693,10 @@ def send_daily_closing_report() -> None:
             f"AI 점수 {get_mode_min_ai_score():.0f}점 이상 시그널이 없었습니다.\n"
             f"누적 분석: {runtime_state['today_analyzed_total']}종목"
         )
-        send_telegram_msg(message)
-        return
+        success = send_telegram_msg(message, chat_id)
+        runtime_state["last_report_at"] = now.isoformat()
+        runtime_state["last_report_status"] = "전송완료" if success else "전송실패"
+        return success
 
     evaluated = []
     for item in history:
@@ -1655,8 +1720,13 @@ def send_daily_closing_report() -> None:
             logger.info("[%s] 장마감 성과 계산 실패: %s", item.get("name"), exc)
 
     if not evaluated:
-        send_telegram_msg(f"📋 <b>[{today} 장 마감]</b>\n\n추천 기록은 있으나 성과 계산에 실패했습니다.")
-        return
+        success = send_telegram_msg(
+            f"📋 <b>[{today} 장 마감]</b>\n\n추천 기록은 있으나 성과 계산에 실패했습니다.",
+            chat_id,
+        )
+        runtime_state["last_report_at"] = now.isoformat()
+        runtime_state["last_report_status"] = "전송완료" if success else "전송실패"
+        return success
 
     avg_return = float(np.mean([x["return"] for x in evaluated]))
     winners = sum(1 for x in evaluated if x["return"] > 0)
@@ -1679,7 +1749,10 @@ def send_daily_closing_report() -> None:
         f"최저: {html.escape(worst['name'])} {worst['return']:+.2f}%\n\n"
         f"<b>[종목별 성과]</b>\n{rows}"
     )
-    send_telegram_msg(message)
+    success = send_telegram_msg(message, chat_id)
+    runtime_state["last_report_at"] = now.isoformat()
+    runtime_state["last_report_status"] = "전송완료" if success else "전송실패"
+    return success
 
 
 # ----------------------------- scheduler -----------------------------
@@ -1692,6 +1765,14 @@ def run_scanner() -> None:
     next_command_at = 0.0
     next_scan_at = 0.0
     next_portfolio_at = 0.0
+
+    saved_schedule = load_scheduler_state()
+    morning_briefing_sent_date = saved_schedule.get("morning_briefing_sent_date")
+    daily_summary_sent_date = saved_schedule.get("daily_summary_sent_date")
+    nxt_open_sent_date = saved_schedule.get("nxt_open_sent_date")
+    reg_open_sent_date = saved_schedule.get("reg_open_sent_date")
+    reg_close_sent_date = saved_schedule.get("reg_close_sent_date")
+    nxt_close_sent_date = saved_schedule.get("nxt_close_sent_date")
 
     logger.info("뽕실로봇 V%s 스케줄러 시작", APP_VERSION)
 
@@ -1707,28 +1788,31 @@ def run_scanner() -> None:
 
             if now.weekday() < 5:
                 if (
-                    now.hour == 7
-                    and 30 <= now.minute < 35
+                    (now.hour > 7 or (now.hour == 7 and now.minute >= 30))
+                    and now.hour < 15
                     and morning_briefing_sent_date != today
                 ):
-                    send_morning_briefing()
-                    morning_briefing_sent_date = today
+                    if send_morning_briefing():
+                        morning_briefing_sent_date = today
+                        save_scheduler_state(morning_briefing_sent_date=today)
 
                 if (
                     now.hour == 8
                     and now.minute < 5
                     and nxt_open_sent_date != today
                 ):
-                    send_telegram_msg("🔔 <b>[NXT 프리마켓 시작]</b>")
-                    nxt_open_sent_date = today
+                    if send_telegram_msg("🔔 <b>[NXT 프리마켓 시작]</b>"):
+                        nxt_open_sent_date = today
+                        save_scheduler_state(nxt_open_sent_date=today)
 
                 if (
                     now.hour == 9
                     and now.minute < 5
                     and reg_open_sent_date != today
                 ):
-                    send_telegram_msg("🔔 <b>[정규장 시작]</b>")
-                    reg_open_sent_date = today
+                    if send_telegram_msg("🔔 <b>[정규장 시작]</b>"):
+                        reg_open_sent_date = today
+                        save_scheduler_state(reg_open_sent_date=today)
 
                 if should_scan_now(now) and timestamp >= next_scan_at:
                     threading.Thread(
@@ -1743,28 +1827,30 @@ def run_scanner() -> None:
                     next_portfolio_at = timestamp + PORTFOLIO_INTERVAL_SECONDS
 
                 if (
-                    now.hour == 15
-                    and 30 <= now.minute < 35
+                    (now.hour > 15 or (now.hour == 15 and now.minute >= 30))
+                    and now.hour <= 23
                     and reg_close_sent_date != today
                 ):
-                    send_telegram_msg("🔔 <b>[정규장 마감]</b>")
-                    reg_close_sent_date = today
+                    if send_telegram_msg("🔔 <b>[정규장 마감]</b>"):
+                        reg_close_sent_date = today
+                        save_scheduler_state(reg_close_sent_date=today)
 
                 if (
-                    now.hour == 15
-                    and 35 <= now.minute < 40
+                    (now.hour > 15 or (now.hour == 15 and now.minute >= 35))
+                    and now.hour <= 23
                     and daily_summary_sent_date != today
                 ):
-                    send_daily_closing_report()
-                    daily_summary_sent_date = today
+                    if send_daily_closing_report():
+                        daily_summary_sent_date = today
+                        save_scheduler_state(daily_summary_sent_date=today)
 
                 if (
-                    now.hour == 20
-                    and now.minute < 5
+                    now.hour >= 20
                     and nxt_close_sent_date != today
                 ):
-                    send_telegram_msg("🔔 <b>[NXT 애프터마켓 마감]</b>")
-                    nxt_close_sent_date = today
+                    if send_telegram_msg("🔔 <b>[NXT 애프터마켓 마감]</b>"):
+                        nxt_close_sent_date = today
+                        save_scheduler_state(nxt_close_sent_date=today)
 
         except Exception:
             logger.exception("메인 스케줄러 오류")
@@ -1815,3 +1901,4 @@ if __name__ == "__main__":
         threaded=True,
         use_reloader=False,
     )
+
