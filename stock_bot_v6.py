@@ -4,9 +4,6 @@ import json
 import html
 import logging
 import threading
-import io
-import zipfile
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -23,17 +20,16 @@ from urllib3.util.retry import Retry
 
 
 # ============================================================
-# 뽕실로봇 V8 Ultimate
+# 뽕실로봇 V7 Ultimate
 # - Wilder RSI / EMA / MACD / ATR / ADX / Bollinger Band
 # - AI Score 100점
 # - 시가총액 상위 200종목
 # - 캐시 / 재시도 / 상태 명령어 / 강제 스캔
 # - ATR 기반 손절 및 트레일링
 # - 안전/일반/공격 추천모드
-# - OpenDART 연결 테스트 및 재무 기반 적정주가 참고값
 # ============================================================
 
-APP_VERSION = "8.0.0"
+APP_VERSION = "7.0.0"
 KST = timezone(timedelta(hours=9))
 
 app = Flask(__name__)
@@ -43,10 +39,6 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 PORTFOLIO_FILE = os.getenv("PORTFOLIO_FILE", "portfolio.json")
 LOG_FILE = os.getenv("LOG_FILE", "stock_bot.log")
 SIGNAL_HISTORY_FILE = os.getenv("SIGNAL_HISTORY_FILE", "signal_history.json")
-DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
-DART_BASE_URL = "https://opendart.fss.or.kr/api"
-DART_TARGET_PER = float(os.getenv("DART_TARGET_PER", "12"))
-DART_TARGET_PBR = float(os.getenv("DART_TARGET_PBR", "1.2"))
 
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "200"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
@@ -109,245 +101,6 @@ runtime_state: Dict[str, Any] = {
 
 _cache: Dict[str, Tuple[float, Any]] = {}
 
-
-
-# ----------------------------- OpenDART -----------------------------
-
-def _dart_get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """OpenDART JSON API를 호출하고 오류 상태를 예외로 변환합니다."""
-    if not DART_API_KEY:
-        raise ValueError("Render 환경변수 DART_API_KEY가 설정되지 않았습니다.")
-
-    request_params = {"crtfc_key": DART_API_KEY, **params}
-    response = http.get(
-        f"{DART_BASE_URL}/{endpoint}",
-        params=request_params,
-        timeout=(5, 20),
-    )
-    response.raise_for_status()
-    payload = response.json()
-    status = str(payload.get("status", ""))
-    if status and status != "000":
-        raise ValueError(
-            f"DART 오류 {status}: {payload.get('message', '알 수 없는 오류')}"
-        )
-    return payload
-
-
-def check_dart_connection() -> Dict[str, Any]:
-    """삼성전자 고유번호로 OpenDART 인증키와 연결 상태를 점검합니다."""
-    try:
-        payload = _dart_get("company.json", {"corp_code": "00126380"})
-        return {
-            "success": True,
-            "status": payload.get("status", "000"),
-            "message": payload.get("message", "정상"),
-            "corp_name": payload.get("corp_name", "삼성전자"),
-            "stock_code": payload.get("stock_code", "005930"),
-        }
-    except Exception as exc:
-        return {
-            "success": False,
-            "status": "ERROR",
-            "message": str(exc),
-        }
-
-
-def get_dart_corp_map(force: bool = False) -> Dict[str, Dict[str, str]]:
-    """DART 고유번호 ZIP을 내려받아 종목코드 기준 매핑을 만듭니다."""
-    cache_key = "dart_corp_map"
-    if not force:
-        cached = cache_get(cache_key, 24 * 60 * 60)
-        if cached:
-            return cached
-
-    if not DART_API_KEY:
-        raise ValueError("DART_API_KEY가 설정되지 않았습니다.")
-
-    response = http.get(
-        f"{DART_BASE_URL}/corpCode.xml",
-        params={"crtfc_key": DART_API_KEY},
-        timeout=(5, 30),
-    )
-    response.raise_for_status()
-
-    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        xml_data = archive.read("CORPCODE.xml")
-
-    root = ET.fromstring(xml_data)
-    mapping: Dict[str, Dict[str, str]] = {}
-    for item in root.findall("list"):
-        stock_code = (item.findtext("stock_code") or "").strip()
-        if not stock_code:
-            continue
-        mapping[stock_code.zfill(6)] = {
-            "corp_code": (item.findtext("corp_code") or "").strip(),
-            "corp_name": (item.findtext("corp_name") or "").strip(),
-        }
-
-    cache_set(cache_key, mapping)
-    return mapping
-
-
-def _dart_amount(value: Any) -> Optional[float]:
-    text = str(value or "").replace(",", "").strip()
-    if not text or text in ("-", "None"):
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def _find_account_amount(rows: list, names: Tuple[str, ...]) -> Optional[float]:
-    """연결재무제표 계정명 후보에서 당기 금액을 찾습니다."""
-    for target in names:
-        for row in rows:
-            account_name = str(row.get("account_nm", "")).replace(" ", "")
-            if target.replace(" ", "") not in account_name:
-                continue
-            for key in ("thstrm_amount", "thstrm_add_amount"):
-                amount = _dart_amount(row.get(key))
-                if amount is not None:
-                    return amount
-    return None
-
-
-def get_dart_fair_value(
-    stock_code: str,
-    current_price: Optional[float] = None,
-) -> Dict[str, Any]:
-    """DART 순이익·자본과 발행주식수로 PER/PBR 적정주가 참고값을 계산합니다."""
-    code = str(stock_code).zfill(6)
-    corp_info = get_dart_corp_map().get(code)
-    if not corp_info:
-        raise ValueError("DART에서 해당 상장사의 고유번호를 찾지 못했습니다.")
-
-    year = get_kst_now().year - 1
-    rows = []
-    used_year = None
-    for business_year in (year, year - 1):
-        try:
-            payload = _dart_get(
-                "fnlttSinglAcntAll.json",
-                {
-                    "corp_code": corp_info["corp_code"],
-                    "bsns_year": str(business_year),
-                    "reprt_code": "11011",
-                    "fs_div": "CFS",
-                },
-            )
-            rows = payload.get("list") or []
-            if rows:
-                used_year = business_year
-                break
-        except ValueError as exc:
-            if "013" not in str(exc):
-                raise
-
-    if not rows:
-        raise ValueError("최근 연결 사업보고서 재무자료를 찾지 못했습니다.")
-
-    net_income = _find_account_amount(
-        rows,
-        ("당기순이익", "연결당기순이익", "지배기업소유주지분순이익"),
-    )
-    equity = _find_account_amount(
-        rows,
-        ("자본총계", "지배기업소유주지분"),
-    )
-    if net_income is None or equity is None:
-        raise ValueError("순이익 또는 자본총계 계정을 확인하지 못했습니다.")
-
-    ticker = yf.Ticker(f"{code}.KS")
-    info = ticker.info or {}
-    shares = safe_float(info.get("sharesOutstanding"), 0)
-    if shares <= 0:
-        fast_info = getattr(ticker, "fast_info", {}) or {}
-        shares = safe_float(fast_info.get("shares"), 0)
-    if shares <= 0:
-        raise ValueError("발행주식수를 확인하지 못했습니다.")
-
-    if current_price is None or current_price <= 0:
-        current_price = safe_float(info.get("currentPrice"), 0)
-    if current_price <= 0:
-        history = ticker.history(period="5d", auto_adjust=False)
-        current_price = safe_float(history["Close"].dropna().iloc[-1], 0)
-    if current_price <= 0:
-        raise ValueError("현재가를 확인하지 못했습니다.")
-
-    eps = net_income / shares
-    bps = equity / shares
-    per_value = max(0, eps * DART_TARGET_PER)
-    pbr_value = max(0, bps * DART_TARGET_PBR)
-    valid_values = [value for value in (per_value, pbr_value) if value > 0]
-    if not valid_values:
-        raise ValueError("적정주가 계산에 사용할 양수 값이 없습니다.")
-
-    fair_value = sum(valid_values) / len(valid_values)
-    undervaluation = (fair_value / current_price - 1) * 100
-    if undervaluation >= 25:
-        attractiveness = "매우 저평가 참고"
-    elif undervaluation >= 10:
-        attractiveness = "저평가 참고"
-    elif undervaluation >= -10:
-        attractiveness = "적정 범위 참고"
-    else:
-        attractiveness = "고평가 주의"
-
-    return {
-        "success": True,
-        "corp_name": corp_info["corp_name"],
-        "business_year": used_year,
-        "current_price": int(current_price),
-        "eps": eps,
-        "bps": bps,
-        "per_value": int(per_value),
-        "pbr_value": int(pbr_value),
-        "fair_value": int(fair_value),
-        "undervaluation": undervaluation,
-        "attractiveness": attractiveness,
-        "target_per": DART_TARGET_PER,
-        "target_pbr": DART_TARGET_PBR,
-    }
-
-
-def format_dart_test_message() -> str:
-    result = check_dart_connection()
-    if result.get("success"):
-        return (
-            "✅ <b>[DART API 연결 성공]</b>\n\n"
-            f"기업명: <b>{html.escape(str(result.get('corp_name', '확인 불가')))}</b>\n"
-            f"종목코드: <b>{html.escape(str(result.get('stock_code', '확인 불가')))}</b>\n\n"
-            "전자공시 재무데이터를 가져올 준비가 완료되었습니다."
-        )
-    return (
-        "⚠️ <b>[DART API 연결 실패]</b>\n\n"
-        f"오류코드: {html.escape(str(result.get('status', '없음')))}\n"
-        f"내용: {html.escape(str(result.get('message', '알 수 없는 오류')))}"
-    )
-
-
-def format_dart_valuation_message(code: str, name: str, current_price: float) -> str:
-    try:
-        value = get_dart_fair_value(code, current_price)
-        return (
-            f"🏛️ <b>[DART 재무가치 참고]</b>\n"
-            f"기준 사업연도: {value['business_year']}년\n"
-            f"PER 방식: <b>{value['per_value']:,}원</b> "
-            f"(목표 PER {value['target_per']:.1f}배)\n"
-            f"PBR 방식: <b>{value['pbr_value']:,}원</b> "
-            f"(목표 PBR {value['target_pbr']:.1f}배)\n"
-            f"평균 적정주가: <b>{value['fair_value']:,}원</b>\n"
-            f"현재가 대비: <b>{value['undervaluation']:+.1f}%</b>\n"
-            f"판정: <b>{html.escape(value['attractiveness'])}</b>"
-        )
-    except Exception as exc:
-        logger.info("[%s %s] DART 가치평가 제외: %s", name, code, exc)
-        return (
-            "🏛️ <b>[DART 재무가치 참고]</b>\n"
-            f"계산 불가: {html.escape(str(exc))}"
-        )
 
 # ----------------------------- recommendation mode -----------------------------
 
@@ -1191,7 +944,7 @@ def format_signal_message(
     warnings = "\n".join(f"• {html.escape(item)}" for item in signal.warnings[:4])
 
     message = (
-        f"🚨 <b>[뽕실로봇 V8 매수 후보]</b>\n"
+        f"🚨 <b>[뽕실로봇 V7 매수 후보]</b>\n"
         f"🧠 <b>AI 점수 {signal.score:.1f}/100 · {signal.grade}등급</b>\n"
         f"🔻 <b>V반등 점수 {signal.v_score:.1f}/10</b>\n\n"
         f"📌 <b>{html.escape(name)}</b> ({code})\n"
@@ -1199,7 +952,6 @@ def format_signal_message(
         f"🎯 1차 목표가: <b>{signal.target_price:,}원</b> "
         f"({signal.upside:+.1f}%)\n"
         f"🛑 참고 손절가: <b>{signal.stop_price:,}원</b>\n\n"
-        f"{format_dart_valuation_message(code, name, signal.current_price)}\n\n"
         f"📊 RSI {signal.rsi:.1f} · ADX {signal.adx:.1f}\n"
         f"📈 예상 거래량 {signal.volume_ratio:.0f}% · "
         f"ATR {signal.atr_percent:.1f}%\n"
@@ -1219,6 +971,7 @@ def format_signal_message(
         f"<i>AI 점수는 기술적 조건을 정량화한 참고값이며 수익을 보장하지 않습니다.</i>"
     )
     return message
+
 
 # ----------------------------- portfolio -----------------------------
 
@@ -1389,7 +1142,7 @@ def run_backtest(code: str, name: str) -> str:
 
         if not trades:
             return (
-                f"📊 <b>[{html.escape(name)}] V8 백테스트</b>\n"
+                f"📊 <b>[{html.escape(name)}] V7 백테스트</b>\n"
                 f"조건에 맞는 완료 거래가 없습니다."
             )
 
@@ -1407,7 +1160,7 @@ def run_backtest(code: str, name: str) -> str:
         )
 
         return (
-            f"📊 <b>[{html.escape(name)}] V8 백테스트</b>\n"
+            f"📊 <b>[{html.escape(name)}] V7 백테스트</b>\n"
             f"<i>약 2년 · 다음 날 시가 진입 · 거래비용 0.30% 반영</i>\n\n"
             f"총 거래: {len(trades)}회\n"
             f"승률: <b>{win_rate:.1f}%</b>\n"
@@ -1587,7 +1340,7 @@ def scan_stocks(force: bool = False, requested_chat_id: Optional[str] = None) ->
 
 def command_help() -> str:
     return (
-        "🤖 <b>[뽕실로봇 V8 명령어]</b>\n\n"
+        "🤖 <b>[뽕실로봇 V7 명령어]</b>\n\n"
         "• <code>/매수 종목명 단가 단타</code>\n"
         "• <code>/매수 종목명 단가 스윙</code>\n"
         "• <code>/수정 종목명 단가 단타</code>\n"
@@ -1595,8 +1348,6 @@ def command_help() -> str:
         "• <code>/목록</code>\n"
         "• <code>/점수 종목명</code>\n"
         "• <code>/백테스트 종목명</code>\n"
-        "• <code>/다트테스트</code>\n"
-        "• <code>/가치 종목명</code>\n"
         "• <code>/시장</code>\n"
         "• <code>/상태</code>\n"
         "• <code>/강제스캔</code>\n"
@@ -1753,33 +1504,6 @@ def handle_command(text: str, chat_id: str) -> None:
                 chat_id,
             )
 
-    elif cmd == "/다트테스트":
-        send_telegram_msg("⏳ DART API 연결을 확인하고 있습니다.", chat_id)
-        send_telegram_msg(format_dart_test_message(), chat_id)
-
-    elif cmd == "/가치":
-        if len(parts) < 2:
-            send_telegram_msg("⚠️ 사용법: /가치 [종목명]", chat_id)
-            return
-        query = " ".join(parts[1:])
-        code, name = resolve_stock(query)
-        if not code or not name:
-            send_telegram_msg("⚠️ 종목을 찾지 못했습니다.", chat_id)
-            return
-        send_telegram_msg(f"⏳ {html.escape(name)} DART 재무가치를 계산 중입니다.", chat_id)
-        try:
-            df = get_price_data(code, 10, force=True)
-            current_price = safe_float(df["Close"].dropna().iloc[-1], 0)
-            send_telegram_msg(
-                format_dart_valuation_message(code, name, current_price),
-                chat_id,
-            )
-        except Exception as exc:
-            send_telegram_msg(
-                f"⚠️ 가치 계산 실패: {html.escape(str(exc))}",
-                chat_id,
-            )
-
     elif cmd == "/시장":
         market = calculate_market_score(force=True)
         send_telegram_msg(
@@ -1868,7 +1592,7 @@ def send_morning_briefing() -> None:
         "애플": "AAPL",
     }
     lines = [
-        f"🌅 <b>[뽕실로봇 V8 장전 브리핑]</b>",
+        f"🌅 <b>[뽕실로봇 V7 장전 브리핑]</b>",
         get_kst_now().strftime("%Y-%m-%d"),
         "",
     ]
@@ -2091,5 +1815,3 @@ if __name__ == "__main__":
         threaded=True,
         use_reloader=False,
     )
-
-
