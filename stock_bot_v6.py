@@ -29,7 +29,7 @@ from urllib3.util.retry import Retry
 # - 안전/일반/공격 추천모드
 # ============================================================
 
-APP_VERSION = "7.1.0"
+APP_VERSION = "7.2.0"
 KST = timezone(timedelta(hours=9))
 
 app = Flask(__name__)
@@ -40,6 +40,7 @@ PORTFOLIO_FILE = os.getenv("PORTFOLIO_FILE", "portfolio.json")
 LOG_FILE = os.getenv("LOG_FILE", "stock_bot.log")
 SIGNAL_HISTORY_FILE = os.getenv("SIGNAL_HISTORY_FILE", "signal_history.json")
 SCHEDULER_STATE_FILE = os.getenv("SCHEDULER_STATE_FILE", "scheduler_state.json")
+CHAT_STATE_FILE = os.getenv("CHAT_STATE_FILE", "chat_state.json")
 
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "200"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
@@ -103,7 +104,13 @@ runtime_state: Dict[str, Any] = {
     "last_report_status": "미전송",
     "last_telegram_error": None,
     "last_candidate_count": 0,
+    "scheduler_heartbeat": None,
+    "morning_briefing_status": "미시도",
+    "morning_briefing_at": None,
+    "scheduled_chat_id_source": "미확인",
+    "scheduled_chat_id_masked": None,
 }
+
 
 _cache: Dict[str, Tuple[float, Any]] = {}
 
@@ -299,6 +306,54 @@ def save_scheduler_state(**updates: Any) -> None:
         logger.warning("스케줄러 상태 저장 실패: %s", exc)
 
 
+def load_saved_chat_id() -> str:
+    if not os.path.exists(CHAT_STATE_FILE):
+        return ""
+    try:
+        with open(CHAT_STATE_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return str(data.get("chat_id", "")).strip() if isinstance(data, dict) else ""
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("채팅 ID 상태 불러오기 실패: %s", exc)
+        return ""
+
+
+def save_chat_id(chat_id: str) -> None:
+    value = str(chat_id or "").strip()
+    if not value:
+        return
+    try:
+        atomic_json_write(CHAT_STATE_FILE, {
+            "chat_id": value,
+            "updated_at": get_kst_now().isoformat(),
+        })
+    except OSError as exc:
+        logger.warning("채팅 ID 상태 저장 실패: %s", exc)
+
+
+def mask_chat_id(chat_id: str) -> str:
+    value = str(chat_id or "").strip()
+    if len(value) <= 4:
+        return "****" if value else "없음"
+    return f"***{value[-4:]}"
+
+
+def get_scheduled_chat_id() -> str:
+    env_chat = str(CHAT_ID or "").strip()
+    saved_chat = load_saved_chat_id()
+    if env_chat:
+        runtime_state["scheduled_chat_id_source"] = "환경변수 CHAT_ID"
+        runtime_state["scheduled_chat_id_masked"] = mask_chat_id(env_chat)
+        return env_chat
+    if saved_chat:
+        runtime_state["scheduled_chat_id_source"] = "최근 명령 채팅 ID"
+        runtime_state["scheduled_chat_id_masked"] = mask_chat_id(saved_chat)
+        return saved_chat
+    runtime_state["scheduled_chat_id_source"] = "없음"
+    runtime_state["scheduled_chat_id_masked"] = None
+    return ""
+
+
 def load_portfolio() -> Dict[str, Any]:
     with portfolio_lock:
         if not os.path.exists(PORTFOLIO_FILE):
@@ -367,40 +422,66 @@ def split_telegram_message(message: str) -> list[str]:
     return chunks
 
 
-def send_telegram_msg(message: str, chat_id: Optional[str] = None) -> bool:
-    target_chat = str(chat_id or CHAT_ID).strip()
-    if not TELEGRAM_TOKEN or not target_chat:
-        logger.warning("텔레그램 환경변수가 없어 메시지를 전송하지 않았습니다.")
+def send_telegram_msg(message: str, chat_id: Optional[str] = None, retries: int = 2) -> bool:
+    target_chat = str(chat_id or get_scheduled_chat_id()).strip()
+    if not TELEGRAM_TOKEN:
+        detail = "TELEGRAM_TOKEN이 비어 있습니다."
+        runtime_state["last_telegram_error"] = detail
+        logger.error(detail)
+        return False
+    if not target_chat:
+        detail = "예약 메시지 대상 CHAT_ID가 없습니다."
+        runtime_state["last_telegram_error"] = detail
+        logger.error(detail)
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    success = True
-    for chunk in split_telegram_message(message):
-        try:
-            response = http.post(
-                url,
-                json={
-                    "chat_id": target_chat,
-                    "text": chunk,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=(5, 15),
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            detail = str(exc)
+    all_success = True
+    for chunk_index, chunk in enumerate(split_telegram_message(message), start=1):
+        delivered = False
+        last_detail = "알 수 없는 오류"
+        for attempt in range(1, max(1, retries) + 2):
+            response = None
             try:
-                if 'response' in locals() and response is not None:
-                    detail = f"{detail} | 응답: {response.text[:500]}"
-            except Exception:
-                pass
-            runtime_state["last_telegram_error"] = detail
-            logger.error("텔레그램 전송 실패: %s", detail)
-            success = False
-    if success:
+                response = http.post(
+                    url,
+                    json={
+                        "chat_id": target_chat,
+                        "text": chunk,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=(5, 15),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not payload.get("ok", False):
+                    raise RuntimeError(f"Telegram 응답 ok=false: {payload}")
+                delivered = True
+                logger.info(
+                    "텔레그램 전송 성공: chat=%s chunk=%s attempt=%s",
+                    mask_chat_id(target_chat), chunk_index, attempt,
+                )
+                break
+            except Exception as exc:
+                last_detail = str(exc)
+                if response is not None:
+                    try:
+                        last_detail = f"{last_detail} | 응답: {response.text[:500]}"
+                    except Exception:
+                        pass
+                logger.error(
+                    "텔레그램 전송 실패: chat=%s chunk=%s attempt=%s/%s error=%s",
+                    mask_chat_id(target_chat), chunk_index, attempt, max(1, retries) + 1, last_detail,
+                )
+                if attempt <= retries:
+                    time.sleep(min(2 ** (attempt - 1), 5))
+        if not delivered:
+            runtime_state["last_telegram_error"] = last_detail
+            all_success = False
+    if all_success:
         runtime_state["last_telegram_error"] = None
-    return success
+    return all_success
 
 
 # ----------------------------- market/listing -----------------------------
@@ -1008,6 +1089,7 @@ def format_signal_message(
     )
     return message
 
+
 # ----------------------------- portfolio -----------------------------
 
 def get_trade_rules(trade_type: str, atr_percent: float) -> Dict[str, float]:
@@ -1400,6 +1482,8 @@ def command_help() -> str:
         "• <code>/상태</code>\n"
         "• <code>/강제스캔</code>\n"
         "• <code>/마감브리핑</code>\n"
+        "• <code>/미국증시</code>\n"
+        "• <code>/테스트</code>\n"
         "• <code>/모드</code>\n"
         "• <code>/모드 안전</code>\n"
         "• <code>/모드 일반</code>\n"
@@ -1585,8 +1669,13 @@ def handle_command(text: str, chat_id: str) -> None:
             f" ({runtime_state['today_best_name'] or '-'})\n"
             f"감시 종목: {len(portfolio)}종목\n"
             f"시장점수: {runtime_state['market_score'] or '미계산'}\n"
+            f"미국증시 브리핑: {runtime_state['morning_briefing_status']}\n"
+            f"미국증시 처리시각: {runtime_state['morning_briefing_at'] or '없음'}\n"
             f"장마감 브리핑: {runtime_state['last_report_status']}\n"
             f"마지막 브리핑: {runtime_state['last_report_at'] or '없음'}\n"
+            f"스케줄러 심박: {runtime_state['scheduler_heartbeat'] or '없음'}\n"
+            f"예약 채팅: {runtime_state['scheduled_chat_id_masked'] or '없음'} "
+            f"({runtime_state['scheduled_chat_id_source']})\n"
             f"텔레그램 오류: {html.escape(str(runtime_state['last_telegram_error'] or '없음'))}\n"
             f"기록파일: {html.escape(SIGNAL_HISTORY_FILE)}\n"
             f"스캔 오류: {html.escape(str(runtime_state['last_scan_error'] or '없음'))}",
@@ -1610,6 +1699,27 @@ def handle_command(text: str, chat_id: str) -> None:
             daemon=True,
             name="manual-closing-report",
         ).start()
+
+    elif cmd == "/미국증시":
+        send_telegram_msg("⏳ 미국증시 브리핑을 불러오는 중입니다.", chat_id)
+        threading.Thread(
+            target=send_morning_briefing,
+            kwargs={"chat_id": chat_id, "manual": True},
+            daemon=True,
+            name="manual-us-briefing",
+        ).start()
+
+    elif cmd == "/테스트":
+        source = runtime_state.get("scheduled_chat_id_source", "미확인")
+        target = runtime_state.get("scheduled_chat_id_masked") or mask_chat_id(get_scheduled_chat_id())
+        send_telegram_msg(
+            f"✅ <b>[텔레그램 전송 테스트 성공]</b>\n"
+            f"버전: V{APP_VERSION}\n"
+            f"명령 채팅: {mask_chat_id(chat_id)}\n"
+            f"예약 채팅: {target}\n"
+            f"예약 채팅 출처: {html.escape(str(source))}",
+            chat_id,
+        )
 
     elif cmd in ("/도움말", "/start"):
         send_telegram_msg(command_help(), chat_id)
@@ -1635,7 +1745,9 @@ def process_telegram_commands() -> None:
             last_update_id = item["update_id"] + 1
             message = item.get("message") or item.get("edited_message") or {}
             text = str(message.get("text", "")).strip()
-            chat_id = str((message.get("chat") or {}).get("id", CHAT_ID))
+            chat_id = str((message.get("chat") or {}).get("id", CHAT_ID)).strip()
+            if chat_id:
+                save_chat_id(chat_id)
             if text.startswith("/"):
                 handle_command(text, chat_id)
     except requests.RequestException as exc:
@@ -1646,7 +1758,15 @@ def process_telegram_commands() -> None:
 
 # ----------------------------- reports -----------------------------
 
-def send_morning_briefing() -> bool:
+def send_morning_briefing(
+    chat_id: Optional[str] = None,
+    manual: bool = False,
+) -> bool:
+    now = get_kst_now()
+    runtime_state["morning_briefing_status"] = "생성중"
+    runtime_state["morning_briefing_at"] = now.isoformat()
+    logger.info("미국증시 브리핑 생성 시작: manual=%s", manual)
+
     tickers = {
         "나스닥": "^IXIC",
         "필라델피아 반도체": "^SOX",
@@ -1655,30 +1775,55 @@ def send_morning_briefing() -> bool:
         "애플": "AAPL",
     }
     lines = [
-        f"🌅 <b>[뽕실로봇 V7 장전 브리핑]</b>",
-        get_kst_now().strftime("%Y-%m-%d"),
+        f"🌅 <b>[뽕실로봇 V7 미국증시 브리핑]</b>",
+        now.strftime("%Y-%m-%d"),
         "",
     ]
 
+    success_count = 0
     for label, ticker in tickers.items():
         try:
-            history = yf.Ticker(ticker).history(period="7d", auto_adjust=False)
+            history = yf.download(
+                ticker,
+                period="7d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                timeout=12,
+            )
+            if history is None or history.empty or "Close" not in history.columns:
+                raise ValueError("종가 데이터 없음")
             closes = history["Close"].dropna()
+            if isinstance(closes, pd.DataFrame):
+                closes = closes.iloc[:, 0]
             if len(closes) < 2:
                 raise ValueError("데이터 부족")
-            change = (closes.iloc[-1] / closes.iloc[-2] - 1) * 100
+            change = (float(closes.iloc[-1]) / float(closes.iloc[-2]) - 1) * 100
             icon = "🟢" if change >= 0 else "🔴"
             lines.append(f"{icon} {label}: {change:+.2f}%")
-        except Exception:
+            success_count += 1
+        except Exception as exc:
+            logger.warning("미국증시 데이터 조회 실패: %s(%s) - %s", label, ticker, exc)
             lines.append(f"⚪ {label}: 확인 불가")
 
     try:
         market = calculate_market_score(force=True)
         lines.extend(["", f"국내 시장강도: {market['score']:.1f}점"])
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("브리핑 국내 시장강도 계산 실패: %s", exc)
 
-    return send_telegram_msg("\n".join(lines))
+    if success_count == 0:
+        lines.extend(["", "⚠️ 미국 시세 제공처 응답이 없어 잠시 후 다시 확인해 주세요."])
+
+    delivered = send_telegram_msg("\n".join(lines), chat_id)
+    runtime_state["morning_briefing_status"] = "전송완료" if delivered else "전송실패"
+    runtime_state["morning_briefing_at"] = get_kst_now().isoformat()
+    logger.info(
+        "미국증시 브리핑 처리 완료: data=%s/%s delivered=%s",
+        success_count, len(tickers), delivered,
+    )
+    return delivered
 
 
 def send_daily_closing_report(chat_id: Optional[str] = None) -> bool:
@@ -1774,13 +1919,28 @@ def run_scanner() -> None:
     reg_close_sent_date = saved_schedule.get("reg_close_sent_date")
     nxt_close_sent_date = saved_schedule.get("nxt_close_sent_date")
 
-    logger.info("뽕실로봇 V%s 스케줄러 시작", APP_VERSION)
+    target_chat = get_scheduled_chat_id()
+    logger.info(
+        "뽕실로봇 V%s 스케줄러 시작 | token=%s | scheduled_chat=%s | source=%s",
+        APP_VERSION,
+        "있음" if TELEGRAM_TOKEN else "없음",
+        mask_chat_id(target_chat),
+        runtime_state.get("scheduled_chat_id_source"),
+    )
+    if target_chat:
+        send_telegram_msg(
+            f"🤖 <b>뽕실로봇 V{APP_VERSION} 시작 완료</b>\n"
+            f"예약 알림 채팅: {mask_chat_id(target_chat)}",
+            target_chat,
+        )
 
     while True:
         try:
             now = get_kst_now()
             timestamp = time.time()
             today = now.strftime("%Y-%m-%d")
+            runtime_state["scheduler_heartbeat"] = now.isoformat()
+            get_scheduled_chat_id()
 
             if timestamp >= next_command_at:
                 process_telegram_commands()
@@ -1792,16 +1952,22 @@ def run_scanner() -> None:
                     and now.hour < 15
                     and morning_briefing_sent_date != today
                 ):
-                    if send_morning_briefing():
+                    logger.info("예약 미국증시 브리핑 실행 조건 충족")
+                    if send_morning_briefing(chat_id=get_scheduled_chat_id()):
                         morning_briefing_sent_date = today
-                        save_scheduler_state(morning_briefing_sent_date=today)
+                        save_scheduler_state(
+                            morning_briefing_sent_date=today,
+                            morning_briefing_sent_at=get_kst_now().isoformat(),
+                        )
+                    else:
+                        logger.error("예약 미국증시 브리핑 전송 실패 - 다음 루프에서 재시도")
 
                 if (
                     now.hour == 8
                     and now.minute < 5
                     and nxt_open_sent_date != today
                 ):
-                    if send_telegram_msg("🔔 <b>[NXT 프리마켓 시작]</b>"):
+                    if send_telegram_msg("🔔 <b>[NXT 프리마켓 시작]</b>", get_scheduled_chat_id()):
                         nxt_open_sent_date = today
                         save_scheduler_state(nxt_open_sent_date=today)
 
@@ -1810,7 +1976,7 @@ def run_scanner() -> None:
                     and now.minute < 5
                     and reg_open_sent_date != today
                 ):
-                    if send_telegram_msg("🔔 <b>[정규장 시작]</b>"):
+                    if send_telegram_msg("🔔 <b>[정규장 시작]</b>", get_scheduled_chat_id()):
                         reg_open_sent_date = today
                         save_scheduler_state(reg_open_sent_date=today)
 
@@ -1831,7 +1997,7 @@ def run_scanner() -> None:
                     and now.hour <= 23
                     and reg_close_sent_date != today
                 ):
-                    if send_telegram_msg("🔔 <b>[정규장 마감]</b>"):
+                    if send_telegram_msg("🔔 <b>[정규장 마감]</b>", get_scheduled_chat_id()):
                         reg_close_sent_date = today
                         save_scheduler_state(reg_close_sent_date=today)
 
@@ -1840,7 +2006,7 @@ def run_scanner() -> None:
                     and now.hour <= 23
                     and daily_summary_sent_date != today
                 ):
-                    if send_daily_closing_report():
+                    if send_daily_closing_report(get_scheduled_chat_id()):
                         daily_summary_sent_date = today
                         save_scheduler_state(daily_summary_sent_date=today)
 
@@ -1848,7 +2014,7 @@ def run_scanner() -> None:
                     now.hour >= 20
                     and nxt_close_sent_date != today
                 ):
-                    if send_telegram_msg("🔔 <b>[NXT 애프터마켓 마감]</b>"):
+                    if send_telegram_msg("🔔 <b>[NXT 애프터마켓 마감]</b>", get_scheduled_chat_id()):
                         nxt_close_sent_date = today
                         save_scheduler_state(nxt_close_sent_date=today)
 
