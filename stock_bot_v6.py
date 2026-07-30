@@ -367,6 +367,52 @@ def send_telegram_msg(message: str, chat_id: Optional[str] = None) -> bool:
     return success
 
 
+
+def initialize_telegram() -> bool:
+    """텔레그램 토큰을 확인하고 기존 webhook을 제거해 polling을 준비합니다."""
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN 환경변수가 비어 있습니다.")
+        return False
+
+    try:
+        me_response = http.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
+            timeout=(5, 10),
+        )
+        me_response.raise_for_status()
+        me_payload = me_response.json()
+        if not me_payload.get("ok"):
+            logger.error("텔레그램 getMe 실패: %s", me_payload)
+            return False
+
+        bot_info = me_payload.get("result") or {}
+        logger.info(
+            "텔레그램 연결 성공: @%s (id=%s)",
+            bot_info.get("username", "unknown"),
+            bot_info.get("id", "unknown"),
+        )
+
+        webhook_response = http.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": False},
+            timeout=(5, 10),
+        )
+        webhook_response.raise_for_status()
+        webhook_payload = webhook_response.json()
+        if not webhook_payload.get("ok"):
+            logger.error("텔레그램 webhook 제거 실패: %s", webhook_payload)
+            return False
+
+        logger.info("텔레그램 webhook 제거 완료, polling 준비 완료")
+        return True
+    except requests.RequestException as exc:
+        logger.error("텔레그램 초기화 실패: %s", exc)
+        return False
+    except Exception:
+        logger.exception("텔레그램 초기화 처리 오류")
+        return False
+
+
 # ----------------------------- market/listing -----------------------------
 
 def get_krx_listing(force: bool = False) -> pd.DataFrame:
@@ -1575,8 +1621,17 @@ def process_telegram_commands() -> None:
             chat_id = str((message.get("chat") or {}).get("id", CHAT_ID))
             if text.startswith("/"):
                 handle_command(text, chat_id)
+    except requests.HTTPError as exc:
+        response_text = ""
+        if exc.response is not None:
+            response_text = exc.response.text[:500]
+        logger.error(
+            "텔레그램 명령 조회 HTTP 오류: %s | 응답=%s",
+            exc,
+            response_text,
+        )
     except requests.RequestException as exc:
-        logger.debug("텔레그램 명령 조회 실패: %s", exc)
+        logger.error("텔레그램 명령 조회 실패: %s", exc)
     except Exception:
         logger.exception("텔레그램 명령 처리 오류")
 
@@ -1690,8 +1745,9 @@ def run_scanner() -> None:
     global reg_close_sent_date, nxt_close_sent_date
 
     next_command_at = 0.0
-    next_scan_at = 0.0
-    next_portfolio_at = 0.0
+    # 시작 직후 대규모 종목 스캔이 명령 수신을 방해하지 않도록 30초 지연
+    next_scan_at = time.time() + 30
+    next_portfolio_at = time.time() + 10
 
     logger.info("뽕실로봇 V%s 스케줄러 시작", APP_VERSION)
 
@@ -1808,6 +1864,11 @@ def start_background_worker() -> None:
 
 
 if __name__ == "__main__":
+    telegram_ready = initialize_telegram()
+    if not telegram_ready:
+        logger.error(
+            "텔레그램 초기화에 실패했습니다. 웹 서버는 실행하지만 명령 수신은 불가능할 수 있습니다."
+        )
     start_background_worker()
     app.run(
         host="0.0.0.0",
