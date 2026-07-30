@@ -4,9 +4,6 @@ import json
 import html
 import logging
 import threading
-import io
-import zipfile
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -32,7 +29,7 @@ from urllib3.util.retry import Retry
 # - 안전/일반/공격 추천모드
 # ============================================================
 
-APP_VERSION = "8.0.0"
+APP_VERSION = "7.0.0"
 KST = timezone(timedelta(hours=9))
 
 app = Flask(__name__)
@@ -50,13 +47,6 @@ COMMAND_INTERVAL_SECONDS = int(os.getenv("COMMAND_INTERVAL_SECONDS", "5"))
 MIN_AI_SCORE = float(os.getenv("MIN_AI_SCORE", "70"))
 MODE_FILE = os.getenv("MODE_FILE", "bot_mode.json")
 DEFAULT_MODE = os.getenv("DEFAULT_MODE", "일반").strip()
-
-# OpenDART
-DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
-DART_CORP_CACHE_SECONDS = int(os.getenv("DART_CORP_CACHE_SECONDS", "86400"))
-DART_FINANCE_CACHE_SECONDS = int(os.getenv("DART_FINANCE_CACHE_SECONDS", "21600"))
-DART_TARGET_PER = float(os.getenv("DART_TARGET_PER", "10"))
-DART_TARGET_PBR = float(os.getenv("DART_TARGET_PBR", "1.0"))
 
 MODE_CONFIG: Dict[str, Dict[str, Any]] = {
     "안전": {
@@ -456,274 +446,6 @@ def get_price_data(
 
     data = data.dropna(subset=["High", "Low", "Close"])
     return cache_set(cache_key, data, DATA_CACHE_SECONDS).copy()
-
-
-
-# ----------------------------- OpenDART valuation -----------------------------
-
-def _dart_request(endpoint: str, params: Dict[str, Any], timeout: Tuple[int, int] = (5, 20)) -> Dict[str, Any]:
-    if not DART_API_KEY:
-        raise ValueError("DART_API_KEY 환경변수가 없습니다.")
-
-    query = {"crtfc_key": DART_API_KEY, **params}
-    url = f"https://opendart.fss.or.kr/api/{endpoint}"
-    response = http.get(url, params=query, timeout=timeout)
-    response.raise_for_status()
-    payload = response.json()
-
-    status = str(payload.get("status", ""))
-    if status and status != "000":
-        message = str(payload.get("message", "OpenDART 오류"))
-        raise ValueError(f"DART {status}: {message}")
-    return payload
-
-
-def get_dart_corp_map(force: bool = False) -> Dict[str, str]:
-    cache_key = "dart_corp_map"
-    if not force:
-        cached = cache_get(cache_key)
-        if cached is not None:
-            return dict(cached)
-
-    if not DART_API_KEY:
-        raise ValueError("DART_API_KEY 환경변수가 없습니다.")
-
-    url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    response = http.get(
-        url,
-        params={"crtfc_key": DART_API_KEY},
-        timeout=(5, 30),
-    )
-    response.raise_for_status()
-
-    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        xml_name = next((name for name in archive.namelist() if name.lower().endswith(".xml")), None)
-        if not xml_name:
-            raise ValueError("DART 기업코드 XML을 찾지 못했습니다.")
-        root = ET.fromstring(archive.read(xml_name))
-
-    corp_map: Dict[str, str] = {}
-    for item in root.findall("list"):
-        stock_code = (item.findtext("stock_code") or "").strip()
-        corp_code = (item.findtext("corp_code") or "").strip()
-        if stock_code and corp_code:
-            corp_map[stock_code.zfill(6)] = corp_code
-
-    if not corp_map:
-        raise ValueError("DART 상장사 코드 목록이 비어 있습니다.")
-
-    return cache_set(cache_key, corp_map, DART_CORP_CACHE_SECONDS)
-
-
-def check_dart_connection() -> Dict[str, Any]:
-    try:
-        corp_map = get_dart_corp_map(force=True)
-        samsung = corp_map.get("005930")
-        if not samsung:
-            raise ValueError("삼성전자 기업코드를 찾지 못했습니다.")
-        return {
-            "success": True,
-            "corp_name": "삼성전자",
-            "stock_code": "005930",
-            "corp_code": samsung,
-            "count": len(corp_map),
-        }
-    except Exception as exc:
-        return {
-            "success": False,
-            "status": "ERROR",
-            "message": str(exc),
-        }
-
-
-def _parse_amount(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    text = str(value).replace(",", "").strip()
-    if not text or text in ("-", "nan", "None"):
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def _pick_financial_amount(rows: list[Dict[str, Any]], account_names: Tuple[str, ...]) -> Optional[float]:
-    for row in rows:
-        account_nm = str(row.get("account_nm", "")).replace(" ", "")
-        if any(name.replace(" ", "") in account_nm for name in account_names):
-            amount = _parse_amount(row.get("thstrm_amount"))
-            if amount is not None:
-                return amount
-    return None
-
-
-def get_dart_financials(code: str, force: bool = False) -> Dict[str, Any]:
-    code = str(code).zfill(6)
-    cache_key = f"dart_financials:{code}"
-    if not force:
-        cached = cache_get(cache_key)
-        if cached is not None:
-            return dict(cached)
-
-    corp_code = get_dart_corp_map(force=False).get(code)
-    if not corp_code:
-        raise ValueError("DART 기업코드를 찾지 못했습니다.")
-
-    current_year = get_kst_now().year
-    last_error: Optional[Exception] = None
-
-    for year in range(current_year - 1, current_year - 5, -1):
-        for fs_div in ("CFS", "OFS"):
-            try:
-                payload = _dart_request(
-                    "fnlttSinglAcnt.json",
-                    {
-                        "corp_code": corp_code,
-                        "bsns_year": str(year),
-                        "reprt_code": "11011",
-                        "fs_div": fs_div,
-                    },
-                )
-                rows = payload.get("list") or []
-                if not rows:
-                    continue
-
-                net_income = _pick_financial_amount(
-                    rows,
-                    ("당기순이익", "연결당기순이익", "지배기업소유주지분순이익"),
-                )
-                equity = _pick_financial_amount(
-                    rows,
-                    ("자본총계", "지배기업소유주지분"),
-                )
-
-                result = {
-                    "corp_code": corp_code,
-                    "year": year,
-                    "fs_div": fs_div,
-                    "net_income": net_income,
-                    "equity": equity,
-                }
-                return cache_set(cache_key, result, DART_FINANCE_CACHE_SECONDS)
-            except Exception as exc:
-                last_error = exc
-
-    if last_error:
-        raise last_error
-    raise ValueError("최근 사업보고서 재무자료를 찾지 못했습니다.")
-
-
-def get_fair_value(code: str, name: str, current_price: Optional[float] = None, force: bool = False) -> Dict[str, Any]:
-    code = str(code).zfill(6)
-    if current_price is None:
-        current_price = safe_float(get_price_data(code, 15, force=force).iloc[-1]["Close"])
-
-    if current_price <= 0:
-        raise ValueError("현재가를 확인하지 못했습니다.")
-
-    finance = get_dart_financials(code, force=force)
-
-    # DART 단일계정 API에는 발행주식수가 없을 수 있어 yfinance 보조 사용
-    shares = None
-    try:
-        ticker = yf.Ticker(f"{code}.KS")
-        info = ticker.fast_info
-        shares = safe_float(getattr(info, "shares", None) or info.get("shares"), 0)
-    except Exception:
-        shares = 0
-
-    if shares <= 0:
-        try:
-            ticker = yf.Ticker(f"{code}.KQ")
-            info = ticker.fast_info
-            shares = safe_float(getattr(info, "shares", None) or info.get("shares"), 0)
-        except Exception:
-            shares = 0
-
-    net_income = finance.get("net_income")
-    equity = finance.get("equity")
-
-    eps = (net_income / shares) if net_income is not None and shares > 0 else None
-    bps = (equity / shares) if equity is not None and shares > 0 else None
-
-    per_value = eps * DART_TARGET_PER if eps is not None and eps > 0 else None
-    pbr_value = bps * DART_TARGET_PBR if bps is not None and bps > 0 else None
-
-    values = [v for v in (per_value, pbr_value) if v is not None and v > 0]
-    fair_value = sum(values) / len(values) if values else None
-    gap_percent = ((fair_value - current_price) / current_price * 100) if fair_value else None
-
-    if gap_percent is None:
-        attractiveness = "평가자료 부족"
-    elif gap_percent >= 30:
-        attractiveness = "저평가 가능성 높음"
-    elif gap_percent >= 10:
-        attractiveness = "저평가 가능성"
-    elif gap_percent > -10:
-        attractiveness = "적정가 부근"
-    elif gap_percent > -25:
-        attractiveness = "다소 고평가"
-    else:
-        attractiveness = "고평가 주의"
-
-    return {
-        "code": code,
-        "name": name,
-        "current_price": int(current_price),
-        "year": finance.get("year"),
-        "fs_div": finance.get("fs_div"),
-        "shares": shares if shares > 0 else None,
-        "eps": eps,
-        "bps": bps,
-        "per_target": DART_TARGET_PER,
-        "pbr_target": DART_TARGET_PBR,
-        "per_value": int(per_value) if per_value else None,
-        "pbr_value": int(pbr_value) if pbr_value else None,
-        "fair_value": int(fair_value) if fair_value else None,
-        "gap_percent": gap_percent,
-        "attractiveness": attractiveness,
-    }
-
-
-def format_dart_test_message() -> str:
-    result = check_dart_connection()
-    if result.get("success"):
-        return (
-            "✅ <b>[DART API 연결 성공]</b>\n\n"
-            f"기업명: <b>{html.escape(str(result.get('corp_name')))}</b>\n"
-            f"종목코드: <b>{html.escape(str(result.get('stock_code')))}</b>\n"
-            f"상장사 코드 수: <b>{int(result.get('count', 0)):,}개</b>\n\n"
-            "전자공시 재무데이터를 가져올 준비가 완료되었습니다."
-        )
-    return (
-        "⚠️ <b>[DART API 연결 실패]</b>\n\n"
-        f"내용: {html.escape(str(result.get('message', '알 수 없는 오류')))}"
-    )
-
-
-def format_fair_value_message(value: Dict[str, Any]) -> str:
-    def money(v: Any) -> str:
-        return f"{int(v):,}원" if v is not None else "계산 불가"
-
-    gap = value.get("gap_percent")
-    gap_text = f"{gap:+.1f}%" if gap is not None else "계산 불가"
-    fs_label = "연결" if value.get("fs_div") == "CFS" else "별도"
-
-    return (
-        f"🏦 <b>[DART 기업가치 참고]</b>\n\n"
-        f"📌 <b>{html.escape(str(value.get('name')))}</b> ({value.get('code')})\n"
-        f"기준 재무제표: {value.get('year')}년 {fs_label}\n"
-        f"현재가: <b>{money(value.get('current_price'))}</b>\n\n"
-        f"PER 기준가: <b>{money(value.get('per_value'))}</b> "
-        f"(목표 PER {value.get('per_target'):g}배)\n"
-        f"PBR 기준가: <b>{money(value.get('pbr_value'))}</b> "
-        f"(목표 PBR {value.get('pbr_target'):g}배)\n"
-        f"평균 적정주가: <b>{money(value.get('fair_value'))}</b>\n"
-        f"현재가 대비: <b>{gap_text}</b>\n"
-        f"판정: <b>{html.escape(str(value.get('attractiveness')))}</b>\n\n"
-        f"<i>DART 공시와 고정 목표배수를 이용한 참고값이며 투자수익을 보장하지 않습니다.</i>"
-    )
 
 
 # ----------------------------- indicators -----------------------------
@@ -1626,8 +1348,6 @@ def command_help() -> str:
         "• <code>/목록</code>\n"
         "• <code>/점수 종목명</code>\n"
         "• <code>/백테스트 종목명</code>\n"
-        "• <code>/다트테스트</code>\n"
-        "• <code>/가치 종목명</code>\n"
         "• <code>/시장</code>\n"
         "• <code>/상태</code>\n"
         "• <code>/강제스캔</code>\n"
@@ -1740,16 +1460,6 @@ def handle_command(text: str, chat_id: str) -> None:
         try:
             _, signal, market = analyze_stock(code, name, force=True)
             send_telegram_msg(format_signal_message(code, name, signal, market), chat_id)
-            try:
-                value = get_fair_value(
-                    code,
-                    name,
-                    current_price=signal.current_price,
-                    force=False,
-                )
-                send_telegram_msg(format_fair_value_message(value), chat_id)
-            except Exception as dart_exc:
-                logger.info("[%s] DART 가치평가 생략: %s", name, dart_exc)
         except Exception as exc:
             send_telegram_msg(f"⚠️ 분석 실패: {html.escape(str(exc))}", chat_id)
 
@@ -1794,30 +1504,6 @@ def handle_command(text: str, chat_id: str) -> None:
                 chat_id,
             )
 
-    elif cmd == "/다트테스트":
-        send_telegram_msg("⏳ DART API 연결을 확인하고 있습니다.", chat_id)
-        send_telegram_msg(format_dart_test_message(), chat_id)
-
-    elif cmd == "/가치":
-        if len(parts) < 2:
-            send_telegram_msg("⚠️ 사용법: /가치 [종목명]", chat_id)
-            return
-        query = " ".join(parts[1:])
-        code, name = resolve_stock(query)
-        if not code or not name:
-            send_telegram_msg("⚠️ 종목을 찾지 못했습니다.", chat_id)
-            return
-        send_telegram_msg(f"⏳ {html.escape(name)} DART 기업가치를 계산하고 있습니다.", chat_id)
-        try:
-            value = get_fair_value(code, name, force=True)
-            send_telegram_msg(format_fair_value_message(value), chat_id)
-        except Exception as exc:
-            logger.exception("DART 기업가치 계산 실패")
-            send_telegram_msg(
-                f"⚠️ 기업가치 계산 실패: {html.escape(str(exc))}",
-                chat_id,
-            )
-
     elif cmd == "/시장":
         market = calculate_market_score(force=True)
         send_telegram_msg(
@@ -1849,7 +1535,6 @@ def handle_command(text: str, chat_id: str) -> None:
             f"감시 종목: {len(portfolio)}종목\n"
             f"시장점수: {runtime_state['market_score'] or '미계산'}\n"
             f"기록파일: {html.escape(SIGNAL_HISTORY_FILE)}\n"
-            f"DART API: {'설정됨' if DART_API_KEY else '미설정'}\n"
             f"오류: {html.escape(str(runtime_state['last_scan_error'] or '없음'))}",
             chat_id,
         )
