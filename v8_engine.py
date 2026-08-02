@@ -332,6 +332,29 @@ class V8SignalEngine:
         self.positions[signal.code] = position
         return position
 
+    def register_manual_position(
+        self,
+        code: str,
+        name: str,
+        market: str,
+        entry_price: float,
+        entry_time: Optional[datetime] = None,
+    ) -> PositionState:
+        """사용자가 직접 매수한 종목을 동적 매도 감시에 등록합니다."""
+        signal = Signal(
+            code=code,
+            name=name,
+            market=market,
+            signal_type="buy_valid",
+            price=entry_price,
+            confidence=100.0,
+            reason=["사용자 직접 매수 등록"],
+            invalidation_price=entry_price * 0.97,
+            protection_price=entry_price * 0.985,
+            timestamp=entry_time or datetime.now(timezone.utc),
+        )
+        return self.register_position(signal)
+
     def close_position(self, code: str) -> None:
         self.positions.pop(code, None)
 
