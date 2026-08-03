@@ -1,8 +1,6 @@
-finance-datareader
-pandas
-numpy
-requests
-Flask
-lxml
-yfinance
-websocket-client
+Flask>=3.0,<4
+requests>=2.31,<3
+websocket-client>=1.7,<2
+FinanceDataReader>=0.9.90
+yfinance>=0.2.40
+pandas>=2.1,<3
