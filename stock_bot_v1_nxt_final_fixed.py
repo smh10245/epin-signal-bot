@@ -31,10 +31,14 @@ class Settings:
     port:int=i('PORT',10000)
     max_candidates:int=i('MAX_CANDIDATES',200)
     realtime_limit:int=i('REALTIME_SUBSCRIPTION_LIMIT',200)
-    ws_trade_limit:int=i('WS_TRADE_LIMIT',8)
-    ws_orderbook_limit:int=i('WS_ORDERBOOK_LIMIT',2)
+    ws_trade_limit:int=i('WS_TRADE_LIMIT',6)
+    ws_orderbook_limit:int=i('WS_ORDERBOOK_LIMIT',1)
+    ws_total_limit:int=i('WS_TOTAL_LIMIT',7)
     ws_subscribe_delay:float=f('WS_SUBSCRIBE_DELAY',0.50)
-    deploy_start_delay:int=i('DEPLOY_START_DELAY',75)
+    
+    # [수정됨] Render 환경변수 오류(캐시 꼬임 등)를 무시하고 240초 대기를 강제 적용합니다.
+    render_start_delay:int=240 
+    
     swing_scan_limit:int=i('SWING_SCAN_LIMIT',40)
     swing_history_days:int=i('SWING_HISTORY_DAYS',220)
     swing_cache_minutes:int=i('SWING_CACHE_MINUTES',360)
@@ -166,7 +170,6 @@ class KIS:
         self.s=requests.Session(); self.token=None; self.token_exp=None; self.approval=None; self.approval_exp=None; self.lock=threading.Lock()
         self.stream_lock=threading.Lock()
         self.stream_running=False
-        self.current_ws=None
     def access(self):
         if self.token and self.token_exp and datetime.now(timezone.utc)<self.token_exp:return self.token
         r=self.s.post(f'{self.rest}/oauth2/tokenP',json={'grant_type':'client_credentials','appkey':SETTINGS.kis_app_key,'appsecret':SETTINGS.kis_app_secret},timeout=20); r.raise_for_status(); d=r.json(); self.token=d['access_token']; self.token_exp=datetime.now(timezone.utc)+timedelta(seconds=max(60,int(d.get('expires_in',86400))-300)); return self.token
@@ -216,9 +219,9 @@ class KIS:
             self.stream_running=True
         try:
             retry=5
-            duplicate_wait=60
-            effective_trade_limit=max(1,SETTINGS.ws_trade_limit)
-            effective_order_limit=max(0,SETTINGS.ws_orderbook_limit)
+            duplicate_wait=180
+            adaptive_trade=max(1,min(SETTINGS.ws_trade_limit,SETTINGS.ws_total_limit))
+            adaptive_order=max(0,min(SETTINGS.ws_orderbook_limit,SETTINGS.ws_total_limit-adaptive_trade))
             while True:
                 if not (SETTINGS.enable_nxt and SETTINGS.kis_env!='virtual'):
                     state['ws_krx']='rest_only'
@@ -267,8 +270,12 @@ class KIS:
 
                     def desired_codes():
                         all_codes=list(dict.fromkeys(codes_fn()))
-                        trade_codes=all_codes[:max(1,effective_trade_limit)]
-                        order_codes=trade_codes[:max(0,min(effective_order_limit,len(trade_codes)))]
+                        # NXT는 체결+호가를 합산해 제한한다. 배포 중 이전 세션이 남아도
+                        # 한도를 밀어붙이지 않도록 현재 적응형 상한만큼만 요청한다.
+                        trade_count=max(1,min(adaptive_trade,SETTINGS.ws_total_limit))
+                        order_count=max(0,min(adaptive_order,SETTINGS.ws_total_limit-trade_count))
+                        trade_codes=all_codes[:trade_count]
+                        order_codes=trade_codes[:order_count]
                         return trade_codes,order_codes
 
                     def refresh_state():
@@ -327,7 +334,7 @@ class KIS:
 
                     def initial_subscribe(ws):
                         try:
-                            time.sleep(3.0)
+                            time.sleep(1.0)
                             if refresh_stop.is_set():
                                 return
                             sync_nxt(ws)
@@ -341,11 +348,9 @@ class KIS:
                             ).start()
                             log.info(
                                 'NXT WS 구독 요청: 체결 최대 %s / 호가 최대 %s, 30초마다 재평가',
-                                effective_trade_limit,effective_order_limit
+                                adaptive_trade,adaptive_order
                             )
                         except Exception as e:
-                            if refresh_stop.is_set():
-                                return
                             refresh_stop.set()
                             state['last_error']=f'NXT 초기 구독: {e}'
                             state['nxt_last_error']=str(e)
@@ -473,12 +478,10 @@ class KIS:
                     ws_app=websocket.WebSocketApp(
                         self.ws,on_open=opened,on_message=message,on_error=error,on_close=closed
                     )
-                    self.current_ws=ws_app
                     ws_app.run_forever(
                         ping_interval=25,ping_timeout=10,skip_utf8_validation=True
                     )
                     refresh_stop.set()
-                    self.current_ws=None
 
                     if duplicate_appkey:
                         with self.lock:
@@ -488,35 +491,19 @@ class KIS:
                         time.sleep(duplicate_wait)
                         retry=5
                     elif subscribe_over:
-                        # Render 구·신 인스턴스 겹침 또는 서버 한도 차이를 고려해
-                        # 8/2 요청이 거절되면 총 구독 8개 이내(6/2)로 한 번만 안전 하향한다.
-                        if effective_trade_limit + effective_order_limit > 8:
-                            effective_order_limit=min(2,effective_order_limit)
-                            effective_trade_limit=max(1,8-effective_order_limit)
-                            state['last_error']=(
-                                f'NXT 구독 한도 초과로 안전 하향: '
-                                f'체결 {effective_trade_limit} / 호가 {effective_order_limit}'
-                            )
-                            log.warning(
-                                'NXT 구독 한도 초과로 안전 하향: 체결 %s / 호가 %s',
-                                effective_trade_limit,effective_order_limit
-                            )
-                        elif effective_order_limit>0:
-                            effective_order_limit-=1
-                            log.warning(
-                                'NXT 구독 한도 재발로 호가 한도 하향: 체결 %s / 호가 %s',
-                                effective_trade_limit,effective_order_limit
-                            )
-                        elif effective_trade_limit>1:
-                            effective_trade_limit-=1
-                            log.warning(
-                                'NXT 구독 한도 재발로 체결 한도 하향: 체결 %s / 호가 %s',
-                                effective_trade_limit,effective_order_limit
-                            )
-                        state['nxt_effective_trade_limit']=effective_trade_limit
-                        state['nxt_effective_orderbook_limit']=effective_order_limit
-                        log.warning('NXT 구독 한도 오류 후 120초 대기합니다.')
-                        time.sleep(120)
+                        # 서버에 이전 배포 세션이 남아 있거나 실제 허용치가 더 낮은 경우
+                        # 다음 연결부터 총 요청 수를 단계적으로 낮춘다.
+                        if adaptive_order>0:
+                            adaptive_order-=1
+                        elif adaptive_trade>1:
+                            adaptive_trade-=1
+                        state['nxt_trade_limit_active']=adaptive_trade
+                        state['nxt_orderbook_limit_active']=adaptive_order
+                        log.warning(
+                            'NXT 구독 한도 초과로 안전 하향: 체결 %s / 호가 %s. 180초 후 재연결합니다.',
+                            adaptive_trade,adaptive_order
+                        )
+                        time.sleep(180)
                         retry=5
                     else:
                         time.sleep(retry)
@@ -548,7 +535,7 @@ log=logging.getLogger('v1.core')
 LABEL={'volume':'거래량 증가','strength':'체결강도','trend':'상승추세','breakout':'돌파','pullback':'눌림목 재돌파','v':'V자 반등','kiyoung':'기영이 패턴','order':'호가 매수우위','sector':'섹터 강도','bottom':'바닥권','base':'바닥 다지기','volume_return':'거래량 재유입','ma_turn':'이평선 전환','box_break':'박스권 돌파 가능성','rebound':'바닥 반등 초기'}
 class State:
     def __init__(self):
-        self.lock=threading.RLock(); self.names={}; self.meta={}; self.candidates={}; self.watch={}; self.positions={}; self.active={}; self.bars={}; self.current={}; self.last_cum={}; self.books={}; self.ticks={}; self.score_history={}; self.sectors={}; self.daily_cache={}; self.runtime={'ws_krx':'rest_only','ws_nxt':'stopped','last_tick':None,'last_error':None,'nxt_trade_requested':0,'nxt_orderbook_requested':0,'nxt_trade_subscribed':0,'nxt_orderbook_subscribed':0,'nxt_effective_trade_limit':SETTINGS.ws_trade_limit,'nxt_effective_orderbook_limit':SETTINGS.ws_orderbook_limit}
+        self.lock=threading.RLock(); self.names={}; self.meta={}; self.candidates={}; self.watch={}; self.positions={}; self.active={}; self.bars={}; self.current={}; self.last_cum={}; self.books={}; self.ticks={}; self.score_history={}; self.sectors={}; self.daily_cache={}; self.runtime={'ws_krx':'rest_only','ws_nxt':'stopped','last_tick':None,'last_error':None,'nxt_trade_requested':0,'nxt_orderbook_requested':0,'nxt_trade_subscribed':0,'nxt_orderbook_subscribed':0}
     def load(self):
         df=fdr.StockListing('KRX')
         names={}; meta={}
@@ -861,7 +848,7 @@ class App:
  def handle(self,text,chat):
   p=text.split();cmd=p[0]
   if cmd in ('/도움말','/help'):BOT.send('<b>명령어</b>\n/상태 /단타 /스윙 /예비후보 /시장 /성과\n/매수 종목 매수가 수량 [단타|스윙]\n/매도 종목 /보유 /보유리셋\n/관심등록 종목 /관심삭제 종목 /관심목록\n/호가 종목 /후보갱신',chat)
-  elif cmd=='/상태':BOT.send(f'🤖 <b>뽕실 V{SETTINGS.version}</b>\n후보 {len(STATE.candidates)}개\nKRX 보조데이터 {STATE.runtime.get("ws_krx","rest_only")}\nNXT {STATE.runtime.get("ws_nxt")} · 체결 확인 {STATE.runtime.get("nxt_trade_subscribed",0)}/{STATE.runtime.get("nxt_trade_requested",0)} · 호가 확인 {STATE.runtime.get("nxt_orderbook_subscribed",0)}/{STATE.runtime.get("nxt_orderbook_requested",0)}\n운영 한도 체결 {STATE.runtime.get("nxt_effective_trade_limit",SETTINGS.ws_trade_limit)} · 호가 {STATE.runtime.get("nxt_effective_orderbook_limit",SETTINGS.ws_orderbook_limit)}\n오늘 추천 {len(self.recs)}/{SETTINGS.daily_limit}\n마지막 체결 {STATE.runtime.get("last_tick") or "-"}\n최근 오류 {STATE.runtime.get("last_error") or "-"}',chat)
+  elif cmd=='/상태':BOT.send(f'🤖 <b>뽕실 V{SETTINGS.version}</b>\n후보 {len(STATE.candidates)}개\nKRX 보조데이터 {STATE.runtime.get("ws_krx","rest_only")}\nNXT {STATE.runtime.get("ws_nxt")} · 체결 확인 {STATE.runtime.get("nxt_trade_subscribed",0)}/{STATE.runtime.get("nxt_trade_requested",0)} · 호가 확인 {STATE.runtime.get("nxt_orderbook_subscribed",0)}/{STATE.runtime.get("nxt_orderbook_requested",0)}\n오늘 추천 {len(self.recs)}/{SETTINGS.daily_limit}\n마지막 체결 {STATE.runtime.get("last_tick") or "-"}\n최근 오류 {STATE.runtime.get("last_error") or "-"}',chat)
   elif cmd=='/단타':BOT.send(self.rank('단타'),chat)
   elif cmd=='/스윙':BOT.send(self.rank('스윙'),chat)
   elif cmd=='/예비후보':BOT.send(self.rank('단타',5)+'\n\n'+self.rank('스윙',5),chat)
@@ -927,7 +914,7 @@ class App:
     if n.hour==7 and 30<=n.minute<35 and sent.get('m')!=d:BOT.send('🌅 <b>장전 브리핑</b>\n\n'+self.rank('스윙',5)+'\n\n전략: 급등 추격 금지, 상승 초입만 선별');sent['m']=d
     if n.hour==15 and 45<=n.minute<50 and sent.get('c')!=d:BOT.send(f'📊 <b>장마감 브리핑</b>\n오늘 추천 {len(self.recs)}건');sent['c']=d
     if n.hour==20 and 5<=n.minute<10 and sent.get('n')!=d:BOT.send('🌙 <b>NXT 마감·익일 준비</b>\n\n'+self.rank('단타',5));sent['n']=d
-    if n-self.last_rec>=timedelta(hours=2) and n-self.last_none>=timedelta(hours=2):BOT.send('📢 최근 2시간 동안 조건 충족이 없어 추천 내역이 없습니다.\n시장을 계속 감시 중입니다.');self.last_none=n
+    if n-self.last_rec>=timedelta(hours=2) and n-self.last_none>=timedelta(hours=2):BOT.send('📢 최근 2시간 동안 조건 충족이 없어 추천 내역이 없습니다.\n시장을 계속 감시 중 매수 시그널 발생 시 알려드립니다.');self.last_none=n
    time.sleep(20)
  def swing_scan_loop(self):
   while True:
@@ -985,9 +972,12 @@ def root():return f'뽕실 V{SETTINGS.version} running',200
 @web.get('/health')
 def health():return jsonify({'status':'ok','version':SETTINGS.version,'runtime':STATE.runtime,'candidates':len(STATE.candidates),'positions':len(POSITION.data)})
 def delayed_app_start():
- delay=max(0,SETTINGS.deploy_start_delay)
+ # Render 무중단 배포 때 이전 인스턴스의 Telegram polling 및 KIS NXT 세션이
+ # 잠시 살아 있어 409/MAX SUBSCRIBE OVER가 발생한다. 웹 헬스체크는 즉시 열고
+ # 외부 세션을 사용하는 봇 본체만 충분히 늦게 시작한다.
+ delay=max(0,SETTINGS.render_start_delay)
  if delay:
-  log.info('Render 이전 인스턴스 종료 대기: %s초 후 봇 시작',delay)
+  log.info('Render 이전 인스턴스 완전 종료 대기: %s초 후 봇 시작',delay)
   time.sleep(delay)
  APP.start()
 
