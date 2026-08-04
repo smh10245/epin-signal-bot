@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# 뽕실 V2 - V8 매매 엔진 및 비동기 텔레그램 통합본
+# 뽕실 V2 - V8 매매 엔진 및 비동기 텔레그램 통합본 (버그 수정본)
 # KIS NXT 100% 실시간 감시 / 정규장 REST 백업 / 동적 방어선(Trailing Stop) 적용
 
 import os
@@ -42,7 +42,7 @@ def pct(n, o): return (n / o - 1) * 100 if o else 0
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '2.0.0'
+    version: str = '2.0.1'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     telegram_polling: bool = b('ENABLE_TELEGRAM_POLLING', True)
@@ -60,6 +60,9 @@ class Settings:
     ws_subscribe_delay: float = f('WS_SUBSCRIBE_DELAY', 0.50)
     render_start_delay: int = i('RENDER_START_DELAY', 120)
     min_intraday_bars: int = i('MIN_INTRADAY_BARS', 12)
+    # [버그 수정] 누락되었던 시총 및 거래대금 필터 속성 복구
+    min_market_cap: float = f('MIN_MARKET_CAP', 100_000_000_000)
+    min_daily_volume: int = i('MIN_DAILY_VOLUME', 20_000)
     nxt_start: str = os.getenv('NXT_WS_START', '08:00')
     nxt_end: str = os.getenv('NXT_WS_END', '20:00')
     nxt_trade_tr: str = os.getenv('KIS_NXT_TRADE_TR_ID', 'H0NXCNT0')
@@ -104,7 +107,7 @@ class AsyncWorker:
             try:
                 if debounce_key:
                     if debounce_key in self.last_sent and (now() - self.last_sent[debounce_key]).total_seconds() < 60:
-                        continue # 1분 이내 동일 알림 무시 (스팸 방지)
+                        continue 
                     self.last_sent[debounce_key] = now()
                 func(*args, **kwargs)
             except Exception as e:
@@ -146,7 +149,6 @@ class Telegram:
                     text = str(m.get('text') or '').strip()
                     chat = str((m.get('chat') or {}).get('id') or '')
                     if text and chat and self.handler:
-                        # 명령어 처리도 백그라운드 스레드로 넘겨 웹소켓 방해 차단
                         threading.Thread(target=self.handler, args=(text, chat), daemon=True).start()
             except Exception as e:
                 time.sleep(10)
@@ -201,7 +203,6 @@ class KIS:
             return self.approval
 
     def get_minute_bars(self, code):
-        """정규장 장 초반 데이터 강제 로드를 위한 1분봉 REST 조회"""
         t = self.access()
         headers = {'authorization': f'Bearer {t}', 'appkey': SETTINGS.kis_app_key, 'appsecret': SETTINGS.kis_app_secret, 'tr_id': 'FHKST03010200', 'custtype': 'P'}
         params = {'FID_ETC_CLS_CODE': '', 'FID_COND_MRKT_DIV_CODE': 'J', 'FID_INPUT_ISCD': code, 'FID_INPUT_HOUR_1': '153000', 'FID_PW_DATA_INCU_YN': 'Y'}
@@ -211,7 +212,6 @@ class KIS:
         except Exception as e: log.warning(f'초기 분봉 로드 실패 {code}: {e}')
         return []
 
-    # 웹소켓 파싱 및 로테이션 루프 (기존 인프라 유지, NXT 100% 집중)
     @staticmethod
     def parse_trade(msg, names):
         if isinstance(msg, (bytes, bytearray)): msg = msg.decode('utf-8', errors='ignore')
@@ -232,7 +232,6 @@ class KIS:
         return out
 
     def stream_nxt(self, engine, runtime_state):
-        """NXT 전용 7슬롯 동적 로테이션 실시간 스트림"""
         with self.stream_lock:
             if self.stream_running: return
             self.stream_running = True
@@ -250,18 +249,17 @@ class KIS:
                 try:
                     key = self.approval_key()
                     runtime_state['ws_nxt'] = 'connecting'
+                    log.info('Websocket connected')
 
                     def send_sub(ws, tr, code, tr_type='1'):
                         payload = {'header': {'approval_key': key, 'custtype': 'P', 'tr_type': tr_type, 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': tr, 'tr_key': code}}}
                         with send_lock: ws.send(json.dumps(payload, ensure_ascii=False))
 
                     def sync_nxt(ws):
-                        # 30초마다 엔진에서 가장 핫한 종목을 다시 받아와 구독 교체
                         hot_codes = engine.get_hot_codes()
                         trade_codes = hot_codes[:adaptive_trade]
                         order_codes = trade_codes[:adaptive_order]
                         wanted_trade = set(trade_codes)
-                        wanted_order = set(order_codes)
 
                         for c in list(requested['trade'] - wanted_trade):
                             send_sub(ws, SETTINGS.nxt_trade_tr, c, '2'); requested['trade'].discard(c); time.sleep(SETTINGS.ws_subscribe_delay)
@@ -313,7 +311,7 @@ class KIS:
 
 KIS_CLIENT = KIS()
 
-# ===== 6. 뽕실 V8 핵심 엔진 (로직/분석/관리) =====
+# ===== 6. 뽕실 V8 핵심 엔진 =====
 class V8Engine:
     def __init__(self):
         self.lock = threading.RLock()
@@ -324,7 +322,6 @@ class V8Engine:
         self.positions: Dict[str, PositionState] = {}
         self.watch: Dict[str, str] = {}
         self.sectors: Dict[str, float] = {}
-        self.daily_cache: Dict[str, tuple] = {}
         self.runtime = {'ws_nxt': 'stopped', 'last_tick': None, 'nxt_trade_requested': 0}
 
     def load_markets(self):
@@ -349,12 +346,14 @@ class V8Engine:
             self.sectors = {k: max(0, min(100, 50 + sum(v) / max(1, len(v)) * 2)) for k, v in buckets.items()}
 
     def get_hot_codes(self) -> List[str]:
-        """NXT 동적 로테이션을 위한 우선순위 산출 (보유 > 관심 > 거래대금 상위)"""
         with self.lock:
             priority = list(self.positions.keys()) + list(self.watch.keys())
             rows = []
             for c, m in self.meta.items():
-                if num(m.get('Marcap')) < SETTINGS.min_market_cap: continue
+                cap = num(m.get('Marcap'))
+                vol = int(num(m.get('Volume')))
+                if cap and cap < SETTINGS.min_market_cap: continue
+                if vol and vol < SETTINGS.min_daily_volume: continue
                 amt = num(m.get('Amount')) or num(m.get('Close')) * num(m.get('Volume'))
                 rows.append((amt, c))
             rows.sort(reverse=True)
@@ -362,8 +361,7 @@ class V8Engine:
             return ordered[:SETTINGS.max_candidates]
 
     def load_initial_bars(self):
-        """09:00 정규장 오픈 시, 핫 종목들의 초기 분봉 강제 로드 (사각지대 해소)"""
-        codes = self.get_hot_codes()[:30] # 상위 30개만 집중 로드
+        codes = self.get_hot_codes()[:30]
         for code in codes:
             raw = KIS_CLIENT.get_minute_bars(code)
             if not raw: continue
@@ -392,10 +390,7 @@ class V8Engine:
                 b.high = max(b.high, tick.price); b.low = min(b.low, tick.price); b.close = tick.price
                 b.volume += max(tick.volume, inc); b.trade_strength = tick.trade_strength
             
-            # 보유 종목 트레일링 스탑 추적
             self._evaluate_sell(tick.code, tick.price, list(q))
-            
-            # 신규 단타 매수 시그널 포착
             if tick.code not in self.positions:
                 self._evaluate_buy(tick.code, list(q))
 
@@ -405,7 +400,6 @@ class V8Engine:
         pos.highest_price = max(pos.highest_price, current_price)
         gain = pct(current_price, pos.entry_price)
 
-        # 동적 방어선 (Trailing Stop) 상향 로직
         if gain >= 8: pos.protection_price = max(pos.protection_price, pos.highest_price * 0.975)
         elif gain >= 5: pos.protection_price = max(pos.protection_price, pos.highest_price * 0.970)
         elif gain >= 2.5: pos.protection_price = max(pos.protection_price, max(pos.entry_price * 1.002, pos.highest_price * 0.965))
@@ -431,7 +425,6 @@ class V8Engine:
         latest = bars[-1]
         recent = bars[-12:]
         
-        # V자 반등 및 돌파 체크 (V8 엔진 로직 압축)
         bottom = min(b.low for b in recent)
         prior_high = max(b.high for b in recent[:-3]) if len(recent) > 3 else latest.high
         decline = pct(bottom, prior_high)
@@ -444,8 +437,6 @@ class V8Engine:
             stop_price = bottom * 0.995
             msg = f"🔥 <b>[단타 포착] {latest.name} ({code})</b>\n💰 <b>현재:</b> {latest.close:,.0f}원 (손절: {stop_price:,.0f}원)\n🎯 <b>목표:</b> 자율 추적\n⚡ <b>전략:</b> V자 반등 & 거래량 {vol_ratio:.1f}배 유입"
             BOT.send(msg, debounce_key=f"buy_{code}")
-            
-            # DB 기록
             DATABASE.insert('recommendations', {'stock_code': code, 'stock_name': latest.name, 'recommended_price': latest.close, 'confidence_score': 85.0, 'recommendation_time': now().isoformat()})
 
 ENGINE = V8Engine()
@@ -471,26 +462,21 @@ class AppManager:
         while True:
             n = now(); d = str(n.date())
             if n.weekday() < 5:
-                # [07:30] 미국 증시 & 장전 스윙 추천
                 if n.hour == 7 and 30 <= n.minute < 40 and sent.get('pre') != d:
                     msg = f"🌎 <b>[굿모닝 브리핑]</b>\n\n{self.get_us_market()}\n\n🌅 <b>[장전 관심 스윙 종목]</b>\n(전일 종가/수급 기반 바닥권 추출중...)"
                     BOT.send(msg); sent['pre'] = d
                 
-                # [08:00] NXT 개장
                 if n.hour == 8 and 0 <= n.minute < 5 and sent.get('nxt_open') != d:
                     BOT.send("🔔 <b>[08:00] NXT 거래 시작!</b>\n실시간 동적 로테이션 감시를 가동합니다."); sent['nxt_open'] = d
 
-                # [09:00] 정규장 개장 & 데이터 강제 로드
                 if n.hour == 9 and 0 <= n.minute < 5 and sent.get('krx_open') != d:
                     BOT.send("🔔 <b>[09:00] 정규장 개장!</b>\n초기 1분봉 데이터를 강제 로드하여 사각지대를 해소합니다.")
                     ENGINE.load_initial_bars()
                     sent['krx_open'] = d
 
-                # [15:30] 정규장 마감
                 if n.hour == 15 and 30 <= n.minute < 35 and sent.get('krx_close') != d:
                     BOT.send(f"📊 <b>[15:30 정규장 마감]</b>\n수고하셨습니다. 현재 추적 중인 포지션: {len(ENGINE.positions)}개"); sent['krx_close'] = d
 
-                # [20:00] NXT 마감
                 if n.hour == 20 and 0 <= n.minute < 5 and sent.get('nxt_close') != d:
                     BOT.send("🌙 <b>[20:00 NXT 거래 종료]</b>\n오늘 하루 봇 운용을 마감합니다. 편안한 밤 되세요!"); sent['nxt_close'] = d
             time.sleep(30)
@@ -499,44 +485,35 @@ class AppManager:
         p = text.split(); cmd = p[0]
         
         if cmd in ('/도움말', '/help'):
-            BOT.send("🤖 <b>뽕실 V2 명령어</b>\n\n/상태 : 봇 건강 상태 및 큐 대기열\n/단타 : NXT 실시간 포착 랭킹\n/보유 : 추적 중인 종목 리스트\n/매수 [종목] [매수가] [수량] : 수동 매수 종목 V8 엔진 추적 등록\n/매도 [종목] : 추적 강제 종료\n/관심 [종목] : 동적 로테이션 최우선 순위 등록", chat)
-        
+            BOT.send("🤖 <b>뽕실 V2 명령어</b>\n\n/상태 : 봇 건강 상태 및 큐 대기열\n/단타 : NXT 실시간 포착 랭킹\n/보유 : 추적 중인 종목 리스트\n/매수 [종목] [매수가] [수량] : 수동 매수 종목 V8 엔진 추적 등록\n/매도 [종목] : 추적 강제 종료", chat)
         elif cmd == '/상태':
             q_size = WORKER.q.qsize()
             BOT.send(f"🤖 <b>뽕실 V{SETTINGS.version} 상태</b>\n\n- NXT 연결: {ENGINE.runtime['ws_nxt']}\n- V8 엔진 가동: 정상\n- 비동기 큐 대기열: {q_size}개\n- 관리 중인 포지션: {len(ENGINE.positions)}개\n- 마지막 틱 수신: {ENGINE.runtime['last_tick'] or '-'}", chat)
-        
         elif cmd == '/보유':
-            if not ENGINE.positions:
-                BOT.send("📭 현재 추적 중인 보유 종목이 없습니다.", chat)
+            if not ENGINE.positions: BOT.send("📭 현재 추적 중인 보유 종목이 없습니다.", chat)
             else:
                 lines = ["💼 <b>[V8 추적 중인 보유 종목]</b>\n"]
                 for x in ENGINE.positions.values():
                     lines.append(f"• <b>{x.name}</b> ({x.entry_price:,.0f}원 매수)\n  └ 최고: {x.highest_price:,.0f}원 | 🛡️ 방어: <b>{x.protection_price:,.0f}원</b>")
                 BOT.send("\n\n".join(lines), chat)
-        
         elif cmd == '/매수' and len(p) >= 4:
             c = p[1]; price = num(p[2]); qty = num(p[3])
             name = ENGINE.names.get(c, c)
-            # 수동 등록 시에도 V8 엔진이 트레일링 스탑을 감시하도록 등록
             ENGINE.positions[c] = PositionState(c, name, 'NXT', price, now(), price, price * 0.97, price * 0.95, qty)
-            BOT.send(f"✅ <b>수동 매수 등록 완료</b>\n\n봇이 <b>{name}</b>의 동적 방어선(트레일링 스탑) 감시를 시작합니다.\n최초 방어선: {price * 0.97:,.0f}원", chat)
-        
+            BOT.send(f"✅ <b>수동 매수 등록 완료</b>\n\n봇이 <b>{name}</b>의 동적 방어선(트레일링 스탑) 감시를 시작합니다.", chat)
         elif cmd == '/매도' and len(p) >= 2:
             c = p[1]
             if c in ENGINE.positions:
                 ENGINE.positions.pop(c)
                 BOT.send(f"✅ <b>{ENGINE.names.get(c, c)}</b> 감시 종료", chat)
-        
         elif cmd == '/단타':
-            # 슬림화된 모바일 UI 랭킹
             codes = ENGINE.get_hot_codes()[:5]
             lines = ["🏆 <b>단타 실시간 핫 리스트 (NXT 감시중)</b>\n"]
             for i, c in enumerate(codes, 1):
                 bars = ENGINE.bars.get(c)
                 price = bars[-1].close if bars else 0
-                lines.append(f"<b>{i}. {ENGINE.names.get(c, c)}</b> ({c})\n└ 현재: {price:,.0f}원 (1분봉 {len(bars) if bars else 0}개 수집)")
+                lines.append(f"<b>{i}. {ENGINE.names.get(c, c)}</b> ({c})\n└ 현재: {price:,.0f}원")
             BOT.send("\n".join(lines), chat)
-            
         else: BOT.send("명령어는 /도움말", chat)
 
 APP_MANAGER = AppManager()
@@ -550,9 +527,7 @@ def health(): return jsonify({'status': 'ok', 'positions': len(ENGINE.positions)
 
 def delayed_start():
     delay = max(0, SETTINGS.render_start_delay)
-    if delay:
-        log.info(f'Render 인스턴스 중복 방지 대기: {delay}초')
-        time.sleep(delay)
+    if delay: time.sleep(delay)
     
     WORKER.start()
     ENGINE.load_markets()
@@ -562,7 +537,7 @@ def delayed_start():
     if SETTINGS.kis_app_key:
         threading.Thread(target=KIS_CLIENT.stream_nxt, args=(ENGINE, ENGINE.runtime), daemon=True).start()
     
-    BOT.send(f"🤖 <b>뽕실 V{SETTINGS.version} 기동 완료!</b>\n- V8 매매 엔진 (다중 타임프레임 추적) 가동\n- 100% NXT 동적 로테이션 활성화\n- 텔레그램 Zero Blocking 적용")
+    BOT.send(f"🤖 <b>뽕실 V{SETTINGS.version} 기동 완료!</b>\n- V8 매매 엔진 가동\n- 100% NXT 동적 로테이션 활성화\n- 텔레그램 Zero Blocking 적용")
 
 if __name__ == '__main__':
     threading.Thread(target=delayed_start, daemon=True).start()
