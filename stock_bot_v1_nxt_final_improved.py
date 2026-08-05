@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 쾌걸스민 V1.0.6 (Ultimate Sniper & Dual AI)
-# 1. 부팅 즉시 KIS 과거 데이터 강제 동기화 (재부팅 시 VWAP 붕괴 방어 완벽 패치)
-# 2. VWAP 기반 거래량 극감 눌림목 저격 로직 (알림 폭탄 방지)
-# 3. 50:50 하이브리드 수급 랭킹 (대형주 포함)
-# 4. 22:00(야간 DB저장) -> 07:00(아침 최종픽) 듀얼 AI 브리핑
+# 🤖 쾌걸스민 V1.0.7 (Ultimate Sniper & Steel Heart)
+# 패치 내역:
+# 1. 스케줄러 분분(Minute) 타임어택 폐지 -> Hour 기준 무조건 1회 실행 보장
+# 2. AI 분석 실패 / API 누락 시에도 원시 데이터 100% 강제 발송 (except: pass 타파)
+# 3. KIS 과거 데이터 강제 동기화 (VWAP 붕괴 방어) 유지
 # ==========================================
 
 import os, json, time, threading, queue, logging, math
@@ -46,7 +46,7 @@ def pct(n, o): return (n / o - 1) * 100 if o else 0
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '1.0.6 (쾌걸스민 Ultimate Sniper)'
+    version: str = '1.0.7 (쾌걸스민 Steel Heart)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -57,7 +57,7 @@ class Settings:
     max_candidates: int = i('MAX_CANDIDATES', 200)
     ws_trade_limit: int = i('WS_TRADE_LIMIT', 6)
     render_start_delay: int = i('RENDER_START_DELAY', 60)
-    min_market_cap: float = f('MIN_MARKET_CAP', 100_000_000_000) # 1천억 하한선 (잡주 컷)
+    min_market_cap: float = f('MIN_MARKET_CAP', 100_000_000_000)
     min_daily_volume: int = i('MIN_DAILY_VOLUME', 20_000)
     nxt_start: str = '08:00'
     nxt_end: str = '20:00'
@@ -109,7 +109,7 @@ class LocalDB:
             if os.path.exists(self.ai_file):
                 with open(self.ai_file, 'r', encoding='utf-8') as f: return json.load(f).get('picks', '저장된 픽 없음')
         except: pass
-        return "어제 저장된 AI 픽 데이터가 없습니다."
+        return "저장된 AI 픽 데이터가 없습니다."
     def save_ai(self, text):
         def _save():
             with open(self.ai_file, 'w', encoding='utf-8') as f: json.dump({'picks': text, 'date': str(now().date())}, f, ensure_ascii=False)
@@ -275,7 +275,7 @@ class PositionEngine:
         for c, v in DATABASE.load_pos().items(): self.data[c] = Position(**v)
     def save(self): DATABASE.save_pos({c: vars(p) for c, p in self.data.items()})
     def register(self, c, n, price, qty, kind):
-        p = Position(c, n, kind, price, qty, price, price * 0.98) # 기본 칼손절 -2%
+        p = Position(c, n, kind, price, qty, price, price * 0.98)
         self.data[c] = p; self.save(); STATE.refresh_candidates(); return p
     def remove(self, c):
         p = self.data.pop(c, None); self.save(); STATE.refresh_candidates(); return p
@@ -302,29 +302,25 @@ class EpinBrain:
         if len(bars) < 15: return None
         latest = bars[-1]
 
-        # 1. VWAP (당일 거래량 가중 평균단가)
         total_vol = sum(b.volume for b in bars)
         if total_vol == 0: return None
         vwap = sum((b.high + b.low + b.close)/3 * b.volume for b in bars) / total_vol
         
-        # 2. 거래량 마름 (10분 평균 대비 40% 이하 급감)
         prev_10 = bars[-11:-1]
         avg_vol = sum(b.volume for b in prev_10) / 10 if prev_10 else 1
         if latest.volume > (avg_vol * 0.4): return None
 
-        # 3. 고점 형성 후 VWAP 1.5% 근접 (눌림목 맥점)
         high_price = max(b.high for b in bars[:-1])
         if latest.close >= high_price * 0.98: return None
         if not (vwap * 0.985 <= latest.close <= vwap * 1.015): return None
 
-        # 4. 체결강도 수급 브레이크 포착
         if latest.trade_strength < 100: return None
 
         return c, STATE.names.get(c, c), '눌림목', latest.close, high_price, vwap * 0.975, 'VWAP 맥점 지지 & 거래량 극감 (세력 이탈 없음)'
 
 BRAIN = EpinBrain()
 
-# ===== 6. 앱 및 듀얼 AI 스케줄러 =====
+# ===== 6. 앱 및 강철심장 스케줄러 =====
 class App:
     def __init__(self):
         self.sent_signals = set()
@@ -340,7 +336,7 @@ class App:
                     for r in reversed(raw):
                         minute = n.replace(hour=int(r['stck_cntg_hour'][:2]), minute=int(r['stck_cntg_hour'][2:4]), second=0, microsecond=0)
                         q.append(Bar(c, STATE.names.get(c,c), 'KRX', minute, num(r['stck_oprc']), num(r['stck_hgpr']), num(r['stck_lwpr']), num(r['stck_prpr']), int(r['cntg_vol']), int(r['acml_vol']), 100))
-        self.sent_signals.clear() # 블랙리스트 초기화
+        self.sent_signals.clear()
         log.info("VWAP 복원 및 스팸 락 초기화 완료")
 
     def on_tick(self, t):
@@ -362,18 +358,30 @@ class App:
                 self.sent_signals.add(c)
                 BOT.send(f"🔫 <b>[쾌걸스민 스나이퍼 포착] {n}</b> ({c})\n\n💰 <b>현재가(맥점):</b> {p:,.0f}원\n🚀 <b>전고점 목표:</b> {pred:,.0f}원 (+{pct(pred, p):.1f}%)\n🛡️ <b>칼손절선:</b> {stop:,.0f}원\n\n⚡ <b>저격 사유:</b> {rsn}")
 
+    # [패치] 야간 AI: 에러나도 원시 데이터 강제 발송
     def run_night_ai(self):
-        if not HAS_GEMINI or not SETTINGS.gemini_api_key or not STATE.top_hybrid_list: return
+        top20_text = "주도주 데이터 없음"
+        if STATE.top_hybrid_list:
+            top20_text = ", ".join([f"{n}(회전율 {t:.1f})" for _, n, _, t in STATE.top_hybrid_list])
+
+        if not HAS_GEMINI or not SETTINGS.gemini_api_key:
+            DATABASE.save_ai(top20_text)
+            BOT.send(f"🌙 <b>[쾌걸스민 야간 브리핑]</b>\n\n오늘의 주도주 20선:\n{top20_text}\n\n(AI API 키 누락으로 분석 생략. 데이터만 저장합니다.)")
+            return
+            
         try:
             genai.configure(api_key=SETTINGS.gemini_api_key)
             model = genai.GenerativeModel('gemini-2.5-flash')
-            top20_text = ", ".join([f"{n}(회전율 {t:.1f})" for _, n, _, t in STATE.top_hybrid_list])
             prompt = f"오늘 한국장 50:50(대금+회전율) 랭킹 최상위 20개 주도주야: {top20_text}\n너는 최고의 퀀트 트레이더 '쾌걸스민'이야. 이 명단 중 내일 시세를 분출할 대장주 딱 5개만 골라서 이유와 함께 설명해. 포맷: 1. 종목명 - 이유"
             response = model.generate_content(prompt)
             DATABASE.save_ai(response.text)
             BOT.send(f"🌙 <b>[쾌걸스민 야간 1차 필터링 완료]</b>\n\n오늘 장 주도주 20개 중 내일의 타겟 5개를 DB에 저장했습니다.\n\n{response.text}")
-        except: pass
+        except Exception as e:
+            log.error(f"야간 AI 에러: {e}")
+            DATABASE.save_ai(top20_text)
+            BOT.send(f"🌙 <b>[쾌걸스민 야간 브리핑 오류]</b>\n\nAI 분석 중 에러({e})가 발생했습니다. 원시 데이터만 저장합니다:\n{top20_text}")
 
+    # [패치] 아침 AI: 에러나도 미증시/어제픽 데이터 강제 발송
     def run_morning_ai(self):
         try:
             res = []
@@ -381,36 +389,46 @@ class App:
                 d = yf.Ticker(symbol).history(period="2d")
                 if len(d) >= 2: res.append(f"{name}: {d['Close'].iloc[-1]:,.2f} ({(d['Close'].iloc[-1] / d['Close'].iloc[-2] - 1) * 100:+.2f}%)")
             us_market = "\n".join(res)
-        except: us_market = "미국 증시 정보 로드 실패"
+        except Exception as e: 
+            us_market = f"미국 증시 정보 로드 실패: {e}"
 
-        if not HAS_GEMINI or not SETTINGS.gemini_api_key: return
+        saved_picks = DATABASE.load_ai()
+
+        if not HAS_GEMINI or not SETTINGS.gemini_api_key: 
+            BOT.send(f"☀️ <b>[쾌걸스민 굿모닝 브리핑]</b>\n\n미증시 현황:\n{us_market}\n\n어제 야간 픽:\n{saved_picks}\n\n(AI API 키 누락으로 교차 검증 생략)")
+            return
 
         try:
-            saved_picks = DATABASE.load_ai()
             genai.configure(api_key=SETTINGS.gemini_api_key)
             model = genai.GenerativeModel('gemini-2.5-flash')
             prompt = f"방금 마감한 미국 증시 결과야: {us_market}\n어젯밤 10시에 네가 뽑아둔 오늘장 예비 타겟 5개야: {saved_picks}\n미증시 결과를 반영해서, 어제 뽑아둔 5개 중 버릴 건 버리고 교체해서 '오늘 아침 최종 5선'을 다시 뽑아. 포맷: 🤖 **[미증시 요약]** \n🎯 **[최종 스나이퍼 5선]** (종목 - 이유)"
             response = model.generate_content(prompt)
             BOT.send(f"☀️ <b>[쾌걸스민 굿모닝 최종 브리핑]</b>\n\n{response.text}")
-        except: pass
+        except Exception as e:
+            log.error(f"아침 AI 에러: {e}")
+            BOT.send(f"☀️ <b>[쾌걸스민 굿모닝 브리핑 오류]</b>\n\nAI 분석 중 에러({e}) 발생.\n\n미증시:\n{us_market}\n\n어제 야간 픽:\n{saved_picks}")
 
+    # [핵심 패치] 스케줄러 시간창(Window) 해제 로직
     def scheduler(self):
         sent = {}
         while True:
             n = now(); d = str(n.date())
-            if n.weekday() < 5:
-                if n.hour == 7 and 0 <= n.minute < 5 and sent.get('ai_morning') != d:
+            if n.weekday() < 5: # 평일만
+                # 07시 대에 아직 발송 안 했으면 언제 켜지든 무조건 1회 쏜다.
+                if n.hour == 7 and sent.get('ai_morning') != d:
                     threading.Thread(target=self.run_morning_ai, daemon=True).start(); sent['ai_morning'] = d
-                if n.hour == 9 and 0 <= n.minute < 5 and sent.get('bars') != d:
+                # 09시 대에 아직 동기화 안 했으면 무조건 1회 실행
+                if n.hour == 9 and sent.get('bars') != d:
                     threading.Thread(target=self.sync_historical_bars, daemon=True).start(); sent['bars'] = d
-                if n.hour == 22 and 0 <= n.minute < 5 and sent.get('ai_night') != d:
+                # 22시 대에 야간 브리핑 안 했으면 무조건 1회 실행
+                if n.hour == 22 and sent.get('ai_night') != d:
                     threading.Thread(target=self.run_night_ai, daemon=True).start(); sent['ai_night'] = d
             time.sleep(20)
 
     def handle(self, text, chat):
         p = text.split(); cmd = p[0]
         if cmd == '/상태': 
-            BOT.send(f"🤖 <b>쾌걸스민 V1.0.6 가동중</b>\n- 50:50 랭킹: 활성 (대형주 포함)\n- 스나이퍼 로직: 활성 (VWAP 복원 완료)\n- 듀얼 AI 메모리: 정상 작동\n- 금일 발송 완료 종목: {len(self.sent_signals)}개", chat)
+            BOT.send(f"🤖 <b>쾌걸스민 V1.0.7 가동중</b>\n- 50:50 랭킹: 활성\n- 스나이퍼 로직: 활성\n- 듀얼 AI 브리핑: 타임어택 방어 해제 완료\n- 금일 발송 완료 종목: {len(self.sent_signals)}개", chat)
         elif cmd == '/매수':
             args = p[1:]
             if len(args) < 3: BOT.send("사용법: /매수 [종목명] [가격] [수량]", chat); return
@@ -442,11 +460,10 @@ class App:
         threading.Thread(target=self.scheduler, daemon=True).start()
         STATE.load(); STATE.refresh_candidates()
         
-        # 부팅 직후 무조건 차트 긁어오기 실행 (재부팅 대비)
         if in_session("08:00", "15:30"): threading.Thread(target=self.sync_historical_bars, daemon=True).start()
         
         threading.Thread(target=KIS_CLIENT.stream, args=(STATE.get_hot_codes, STATE.names, self.on_tick, STATE.runtime), daemon=True).start()
-        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n\n1. 대형주 포함 하이브리드 수급 랭킹\n2. VWAP 거래량 극감 눌림목 저격 모드 (복원 패치 완료)\n3. 야간-아침 듀얼 교차검증 AI 탑재")
+        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n\n1. 하이브리드 수급 랭킹 & VWAP 저격\n2. 강철심장 스케줄러 (타임어택 붕괴 버그 패치)\n3. AI 오류 시 원시데이터 강제 전송 시스템 탑재")
 
 APP = App(); web = Flask(__name__)
 @web.get('/')
