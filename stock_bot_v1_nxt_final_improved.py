@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 이핀로봇 V1 (Epin Robot) - 단일 배포본 (안정화 패치 적용완료)
-# 철학: 초경량, 확실한 수급 감시, AI 모닝 브리핑 결합
+# 🤖 이핀로봇 V1.0.2 (Epin Robot - Ultra Perfect Patch)
+# 패치 내역: 
+# 1. /매수 '원'/'주' 단위 및 띄어쓰기 종목명 유연 파싱
+# 2. 해외 IP(Render) KRX 차단 우회 (네이버 금융 Fallback)
+# 3. KIS 웹소켓 에러 방어막 및 API 차단 방지
 # ==========================================
 
 import os, json, time, threading, queue, logging, math
@@ -17,7 +20,7 @@ import yfinance as yf
 from flask import Flask, jsonify
 from zoneinfo import ZoneInfo
 
-# 구글 Gemini AI 연동 (모닝 브리핑용)
+# 구글 Gemini AI 연동
 try:
     import google.generativeai as genai
     HAS_GEMINI = True
@@ -37,14 +40,19 @@ def i(n, d):
 def f(n, d): 
     try: return float(os.getenv(n, str(d)))
     except: return d
+
+# [패치] '원', '주', 콤마(,)가 들어가도 숫자만 깔끔하게 추출하는 함수
 def num(v, d=0.0):
-    try: return float(str(v).replace(',', '').strip())
+    try:
+        s = str(v).replace(',', '').replace('원', '').replace('주', '').strip()
+        return float(s)
     except: return d
+
 def pct(n, o): return (n / o - 1) * 100 if o else 0
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '1.0.1 (Epin Patched)'
+    version: str = '1.0.2 (Epin Final Patch)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -209,7 +217,6 @@ class KIS:
                         if 'PINGPONG' in msg:
                             with send_lock: ws.send(msg)
                             return
-                        # [패치 1] JSON 에러 응답 핸들링 (MAX SUBSCRIBE OVER 방어)
                         try:
                             d = json.loads(msg)
                             body = d.get('body') or {}
@@ -249,12 +256,31 @@ class EpinState:
     def __init__(self):
         self.lock = threading.RLock(); self.names = {}; self.meta = {}; self.candidates = {}; self.bars = {}
         self.runtime = {'ws_nxt': 'stopped'}
+        
+    # [패치] 해외 IP(Render) KRX 접속 차단 우회 로직 (KOSPI+KOSDAQ 분할)
     def load(self):
-        df = fdr.StockListing('KRX')
+        import pandas as pd
+        df = None
+        try: df = fdr.StockListing('KRX')
+        except: pass
+        
+        if df is None or df.empty:
+            try:
+                df_kospi = fdr.StockListing('KOSPI')
+                df_kosdaq = fdr.StockListing('KOSDAQ')
+                df = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+            except Exception as e:
+                log.error(f"종목 리스트 우회 로드 실패: {e}")
+                return
+
         with self.lock:
             for _, r in df.iterrows():
                 c = str(r.get('Code') or r.get('Symbol') or '').strip().zfill(6)
-                if c != '000000': self.names[c] = str(r.get('Name') or c).strip(); self.meta[c] = {str(k): r[k] for k in df.columns}
+                n = str(r.get('Name') or c).strip()
+                if c and c != '000000' and c.lower() != 'nan':
+                    self.names[c] = n
+                    self.meta[c] = {str(k): r[k] for k in df.columns}
+
     def refresh_candidates(self):
         rows = []
         with self.lock:
@@ -264,9 +290,26 @@ class EpinState:
             rows.sort(reverse=True)
             priority = list(POSITIONS.data.keys())
             self.candidates = priority + [c for _, c in rows if c not in priority][:SETTINGS.max_candidates]
+
     def get_hot_codes(self):
         with self.lock: return self.candidates[:SETTINGS.ws_trade_limit]
+
 STATE = EpinState()
+
+# [패치] 스마트 종목 검색 유틸리티 (대소문자, 띄어쓰기 무시)
+def resolve_code(q):
+    if not q: return None
+    q_clean = str(q).replace(' ', '').strip().lower()
+    if not q_clean: return None
+    if q_clean.isdigit(): return q_clean.zfill(6)
+    with STATE.lock:
+        for code, name in STATE.names.items():
+            if str(name).replace(' ', '').strip().lower() == q_clean:
+                return code
+        for code, name in STATE.names.items():
+            if q_clean in str(name).replace(' ', '').strip().lower():
+                return code
+    return None
 
 class PositionEngine:
     def __init__(self): self.data = {}
@@ -288,44 +331,38 @@ class PositionEngine:
         p.highest = max(p.highest, current_price)
         gain = pct(current_price, p.entry)
         
-        # 동적 트레일링 스탑 (이핀로봇 핵심 관리)
         if gain >= 10: p.stop = max(p.stop, p.highest * 0.96)
         elif gain >= 5: p.stop = max(p.stop, p.highest * 0.97)
-        elif gain >= 3: p.stop = max(p.stop, p.entry * 1.01) # 무조건 익절 확보
+        elif gain >= 3: p.stop = max(p.stop, p.entry * 1.01)
 
         if current_price <= p.stop:
             msg = f"🛡️ <b>[이핀 방어선 이탈 익절/손절] {p.name}</b>\n💰 현재가: {current_price:,.0f}원 ({gain:+.2f}%)\n감시를 종료합니다."
             self.remove(c)
         else: self.save()
         return msg
+
 POSITIONS = PositionEngine()
 
 class EpinBrain:
-    # [1] 단타 로직 (수급 폭발 & 돌파)
     def check_day_trade(self, c):
         bars = list(STATE.bars.get(c, []))
         if len(bars) < 15: return None
         latest = bars[-1]
 
-        # 1. 거래량 3배(300%) 폭발 확인
         prev_10 = bars[-11:-1]
         avg_vol = sum(b.volume for b in prev_10) / 10 if prev_10 else 1
         if avg_vol == 0: avg_vol = 1
         if latest.volume < (avg_vol * 3.0): return None
 
-        # 2. 15분 단기 박스권 돌파 확인
         prev_15 = bars[-16:-1]
         high_15 = max(b.high for b in prev_15) if prev_15 else latest.high
         if latest.close <= high_15: return None
-
-        # 3. 체결강도 100 이상 매수 우위 확인
         if latest.trade_strength < 100.0: return None
 
-        predicted = latest.close * 1.05 # 예측 상승 주가 (돌파 후 5% 기대)
-        stop = min(b.low for b in bars[-5:]) # 최근 5분 저점 손절
+        predicted = latest.close * 1.05
+        stop = min(b.low for b in bars[-5:])
         return c, STATE.names.get(c, c), '단타', latest.close, predicted, stop, '거래량 300% 폭발 & 15분 고점 돌파'
 
-    # [2] 스윙 로직 (종배 턴어라운드)
     def check_swing_trade(self, c):
         try:
             end = now().date() + timedelta(days=1); start = end - timedelta(days=60)
@@ -336,18 +373,18 @@ class EpinBrain:
             latest_c = close.iloc[-1]; latest_o = open_p.iloc[-1]
             latest_v = vol.iloc[-1]; prev_v = vol.iloc[-2]
             
-            if latest_c <= latest_o: return None # 양봉 아님
-            if latest_v < (prev_v * 1.5): return None # 거래량 안 터짐
+            if latest_c <= latest_o or latest_v < (prev_v * 1.5): return None
             
             down_days = (close.iloc[-6:-1].diff().dropna() < 0).sum()
             near_bottom = latest_c <= (low.tail(20).min() * 1.05)
             
             if down_days >= 3 or near_bottom:
-                predicted = latest_c * 1.10 # 예측 상승 주가 (바닥 탈출 10% 기대)
+                predicted = latest_c * 1.10
                 stop = low.tail(20).min() * 0.98
                 return c, STATE.names.get(c, c), '스윙', latest_c, predicted, stop, '바닥권 확인 & 거래량 1.5배 추세 전환 양봉'
         except: pass
         return None
+
 BRAIN = EpinBrain()
 
 # ===== 6. 애플리케이션 및 스케줄러 =====
@@ -364,11 +401,9 @@ class App:
             else:
                 b = q[-1]; b.high = max(b.high, t.price); b.low = min(b.low, t.price); b.close = t.price; b.volume += t.volume; b.trade_strength = t.trade_strength
         
-        # 1. 트레일링 스탑 감시
         msg = POSITIONS.evaluate_trailing_stop(t.code, t.price)
         if msg: BOT.send(msg)
 
-        # 2. 단타 시그널 감시
         if t.code not in POSITIONS.data and t.code not in self.sent_signals:
             sig = BRAIN.check_day_trade(t.code)
             if sig:
@@ -382,7 +417,7 @@ class App:
         for c in STATE.candidates[:40]:
             sig = BRAIN.check_swing_trade(c)
             if sig: found.append(sig)
-            time.sleep(0.2)  # [패치 3] API 차단 방지용 0.2초 휴식
+            time.sleep(0.2)
             
         if found:
             for c, n, k, p, pred, stop, rsn in found:
@@ -442,47 +477,58 @@ class App:
                             for r in reversed(raw):
                                 minute = n.replace(hour=int(r['stck_cntg_hour'][:2]), minute=int(r['stck_cntg_hour'][2:4]), second=0, microsecond=0)
                                 q.append(Bar(c, STATE.names.get(c,c), 'KRX', minute, num(r['stck_oprc']), num(r['stck_hgpr']), num(r['stck_lwpr']), num(r['stck_prpr']), int(r['cntg_vol']), int(r['acml_vol']), 100))
-                    sent['bars'] = d; self.sent_signals.clear() # 매일 시그널 초기화
+                    sent['bars'] = d; self.sent_signals.clear()
                 if n.hour == 15 and 15 <= n.minute < 20 and sent.get('swing') != d:
                     threading.Thread(target=self.run_swing_scan, daemon=True).start(); sent['swing'] = d
             time.sleep(20)
 
     def handle(self, text, chat):
         p = text.split(); cmd = p[0]
-        if cmd == '/상태': BOT.send(f"🤖 <b>이핀로봇 V1 가동중</b>\n- NXT 연결: {STATE.runtime['ws_nxt']}\n- 감시 후보: {len(STATE.candidates)}개\n- 관리중인 보유종목: {len(POSITIONS.data)}개\n- 오늘 단타 포착: {len(self.sent_signals)}회", chat)
+        if cmd == '/상태': 
+            BOT.send(f"🤖 <b>이핀로봇 V1 가동중</b>\n- NXT 연결: {STATE.runtime['ws_nxt']}\n- 감시 후보: {len(STATE.candidates)}개\n- 관리중인 보유종목: {len(POSITIONS.data)}개\n- 오늘 단타 포착: {len(self.sent_signals)}회", chat)
         
-        elif cmd == '/매수' and len(p) >= 4:
-            # [패치 2] 띄어쓰기 종목명을 완벽하게 파싱하는 로직
-            kind = p[-1] if p[-1] in ('단타', '스윙') else '단타'
-            qty_idx = -2 if kind in ('단타', '스윙') else -1
-            try:
-                qty = num(p[qty_idx]); price = num(p[qty_idx - 1])
-                c_raw = " ".join(p[1:qty_idx - 1]) # 나머지 중간 부분은 모두 종목명으로 합침
-            except:
-                BOT.send("명령어 오류. /매수 [종목명] [가격] [수량] 형식으로 입력해주세요.", chat)
+        elif cmd == '/매수':
+            if len(p) < 4:
+                BOT.send("사용법: /매수 [종목명] [가격] [수량] [단타|스윙(선택)]\n예: /매수 삼성전자 74000원 10주", chat)
                 return
-
-            c = c_raw.zfill(6) if c_raw.isdigit() else ([code for code, name in STATE.names.items() if name.replace(' ', '') == c_raw.replace(' ', '')] + [None])[0]
+            args = p[1:]
+            kind = '단타'
+            if args and args[-1] in ('단타', '스윙'):
+                kind = args.pop()
+            if len(args) < 3:
+                BOT.send("사용법: /매수 [종목명] [가격] [수량]\n예: /매수 LS ELECTRIC 74000 10", chat)
+                return
             
-            if c and price > 0:
-                p_obj = POSITIONS.register(c, STATE.names.get(c,c), price, qty, kind)
-                BOT.send(f"✅ <b>[이핀 매수 등록 완료] {p_obj.name}</b>\n\n매수가: {price:,.0f}원\n수량: {qty}주\n봇이 동적 트레일링 스탑 관리를 시작합니다.", chat)
-            else: BOT.send("종목명(또는 코드)을 찾을 수 없거나 가격이 잘못되었습니다.", chat)
+            qty = num(args[-1])
+            price = num(args[-2])
+            stock_raw = " ".join(args[:-2])
+            c = resolve_code(stock_raw)
             
+            if c and price > 0 and qty > 0:
+                p_obj = POSITIONS.register(c, STATE.names.get(c, c), price, qty, kind)
+                BOT.send(f"✅ <b>[이핀 매수 등록 완료] {p_obj.name}</b> ({c})\n\n💰 매수가: {price:,.0f}원\n📦 수량: {qty:g}주\n📌 유형: {kind}\n🛡️ 봇이 동적 트레일링 스탑 관리를 시작합니다.", chat)
+            else:
+                BOT.send(f"❌ <b>등록 실패</b>\n종목명('<b>{stock_raw}</b>') 또는 가격({price:,.0f}), 수량({qty})을 확인해 주세요.", chat)
+                
         elif cmd == '/매도' and len(p) >= 2:
-            c_raw = " ".join(p[1:]) # [패치 2] 매도 시 띄어쓰기 이름 지원
-            c = c_raw.zfill(6) if c_raw.isdigit() else ([code for code, name in STATE.names.items() if name.replace(' ', '') == c_raw.replace(' ', '')] + [None])[0]
-            p_obj = POSITIONS.remove(c)
-            if p_obj: BOT.send(f"✅ <b>{p_obj.name}</b> 감시를 강제 종료했습니다.", chat)
-            else: BOT.send("해당 종목이 감시 목록에 없습니다.", chat)
-            
+            stock_raw = " ".join(p[1:])
+            c = resolve_code(stock_raw)
+            p_obj = POSITIONS.remove(c) if c else None
+            if p_obj:
+                BOT.send(f"✅ <b>{p_obj.name}</b> 감시를 강제 종료했습니다.", chat)
+            else:
+                BOT.send(f"❌ '<b>{stock_raw}</b>' 종목을 관리 목록에서 찾을 수 없습니다.", chat)
+                
         elif cmd == '/보유':
-            if not POSITIONS.data: BOT.send("📭 이핀로봇이 관리 중인 종목이 없습니다.", chat)
+            if not POSITIONS.data:
+                BOT.send("📭 이핀로봇이 관리 중인 종목이 없습니다.", chat)
             else:
                 msg = "💼 <b>[이핀 보유 관리 현황]</b>\n\n"
-                for p_obj in POSITIONS.data.values(): msg += f"• <b>{p_obj.name}</b> ({p_obj.entry:,.0f}원 매수)\n  └ 🛡️ 트레일링 손절선: {p_obj.stop:,.0f}원\n"
+                for p_obj in POSITIONS.data.values():
+                    msg += f"• <b>{p_obj.name}</b> ({p_obj.code}) · {p_obj.kind}\n  └ 매수가: {p_obj.entry:,.0f}원 | 수량: {p_obj.qty:g}주\n  └ 🛡️ 트레일링 손절선: {p_obj.stop:,.0f}원\n\n"
                 BOT.send(msg, chat)
-        else: BOT.send("명령어: /상태, /보유, /매수 [종목] [가격] [수량], /매도 [종목]", chat)
+        else: 
+            BOT.send("명령어: /상태, /보유, /매수 [종목] [가격] [수량], /매도 [종목]", chat)
 
     def start(self):
         TELEGRAM_WORKER.start(); DB_WORKER.start(); POSITIONS.load()
@@ -491,6 +537,7 @@ class App:
         STATE.load(); STATE.refresh_candidates()
         threading.Thread(target=KIS_CLIENT.stream, args=(STATE.get_hot_codes, STATE.names, self.on_tick, STATE.runtime), daemon=True).start()
         BOT.send(f"🚀 <b>이핀로봇 V{SETTINGS.version} 기동 완료!</b>\n\n- 초경량 수급 폭발 감시 활성화\n- 로컬 JSON 메모리 시스템 로드 완료\n- AI 모닝 브리핑 탑재 완료")
+
 APP = App()
 
 # ===== 7. 웹 서버 =====
