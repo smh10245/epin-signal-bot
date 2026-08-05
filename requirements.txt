@@ -5,4 +5,4 @@ finance-datareader
 yfinance>=0.2.40
 pandas>=2.1,<3
 numpy
-google-generativeai
+google-genai
