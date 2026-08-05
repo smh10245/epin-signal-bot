@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 이핀로봇 V1.0.2 (Epin Robot - Ultra Perfect Patch)
-# 패치 내역: 
-# 1. /매수 '원'/'주' 단위 및 띄어쓰기 종목명 유연 파싱
-# 2. 해외 IP(Render) KRX 차단 우회 (네이버 금융 Fallback)
-# 3. KIS 웹소켓 에러 방어막 및 API 차단 방지
+# 🤖 이핀로봇 V1.0.3 (Epin Robot - Holdings Price Patch)
+# 패치 내역: /보유 명령어 호출 시 현재가 및 실시간 수익률(%) 표시 기능 추가
 # ==========================================
 
 import os, json, time, threading, queue, logging, math
@@ -41,7 +38,6 @@ def f(n, d):
     try: return float(os.getenv(n, str(d)))
     except: return d
 
-# [패치] '원', '주', 콤마(,)가 들어가도 숫자만 깔끔하게 추출하는 함수
 def num(v, d=0.0):
     try:
         s = str(v).replace(',', '').replace('원', '').replace('주', '').strip()
@@ -52,7 +48,7 @@ def pct(n, o): return (n / o - 1) * 100 if o else 0
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '1.0.2 (Epin Final Patch)'
+    version: str = '1.0.3 (Holdings Price Patch)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -257,7 +253,6 @@ class EpinState:
         self.lock = threading.RLock(); self.names = {}; self.meta = {}; self.candidates = {}; self.bars = {}
         self.runtime = {'ws_nxt': 'stopped'}
         
-    # [패치] 해외 IP(Render) KRX 접속 차단 우회 로직 (KOSPI+KOSDAQ 분할)
     def load(self):
         import pandas as pd
         df = None
@@ -288,15 +283,19 @@ class EpinState:
                 if num(m.get('Marcap')) < SETTINGS.min_market_cap or num(m.get('Volume')) < SETTINGS.min_daily_volume: continue
                 rows.append((num(m.get('Amount')) or num(m.get('Close')) * num(m.get('Volume')), c))
             rows.sort(reverse=True)
+            # 보유 종목은 감시 후보 최우선 순위에 자동 편입하여 NXT 실시간 수신 보장
             priority = list(POSITIONS.data.keys())
             self.candidates = priority + [c for _, c in rows if c not in priority][:SETTINGS.max_candidates]
 
     def get_hot_codes(self):
-        with self.lock: return self.candidates[:SETTINGS.ws_trade_limit]
+        with self.lock:
+            # 보유 종목은 무조건 NXT 감시 목록에 포함되도록 최우선 배치
+            priority = list(POSITIONS.data.keys())
+            hot = priority + [c for c in self.candidates if c not in priority]
+            return hot[:SETTINGS.ws_trade_limit]
 
 STATE = EpinState()
 
-# [패치] 스마트 종목 검색 유틸리티 (대소문자, 띄어쓰기 무시)
 def resolve_code(q):
     if not q: return None
     q_clean = str(q).replace(' ', '').strip().lower()
@@ -322,9 +321,13 @@ class PositionEngine:
     def register(self, c, n, price, qty, kind):
         stop = price * (0.97 if kind == '단타' else 0.95)
         p = Position(c, n, kind, price, qty, price, stop)
-        self.data[c] = p; self.save(); return p
+        self.data[c] = p; self.save()
+        STATE.refresh_candidates() # 보유 등록 즉시 감시 순위 갱신
+        return p
     def remove(self, c):
-        p = self.data.pop(c, None); self.save(); return p
+        p = self.data.pop(c, None); self.save()
+        STATE.refresh_candidates()
+        return p
     def evaluate_trailing_stop(self, c, current_price):
         p = self.data.get(c); msg = None
         if not p: return None
@@ -525,7 +528,15 @@ class App:
             else:
                 msg = "💼 <b>[이핀 보유 관리 현황]</b>\n\n"
                 for p_obj in POSITIONS.data.values():
-                    msg += f"• <b>{p_obj.name}</b> ({p_obj.code}) · {p_obj.kind}\n  └ 매수가: {p_obj.entry:,.0f}원 | 수량: {p_obj.qty:g}주\n  └ 🛡️ 트레일링 손절선: {p_obj.stop:,.0f}원\n\n"
+                    # 실시간 현재가 조회 (메모리에 저장된 가장 최근 분봉 캔들 종가 기준)
+                    bars = STATE.bars.get(p_obj.code)
+                    curr_price = bars[-1].close if bars else p_obj.entry
+                    gain = pct(curr_price, p_obj.entry)
+                    emoji = "🟢" if gain >= 0 else "🔴"
+                    
+                    msg += f"• <b>{p_obj.name}</b> ({p_obj.code}) · {p_obj.kind}\n"
+                    msg += f"  └ 매수가: {p_obj.entry:,.0f}원 | 현재가: <b>{curr_price:,.0f}원</b> ({emoji} <b>{gain:+.2f}%</b>)\n"
+                    msg += f"  └ 수량: {p_obj.qty:g}주 | 🛡️ 손절선: {p_obj.stop:,.0f}원\n\n"
                 BOT.send(msg, chat)
         else: 
             BOT.send("명령어: /상태, /보유, /매수 [종목] [가격] [수량], /매도 [종목]", chat)
@@ -536,7 +547,7 @@ class App:
         threading.Thread(target=self.scheduler, daemon=True).start()
         STATE.load(); STATE.refresh_candidates()
         threading.Thread(target=KIS_CLIENT.stream, args=(STATE.get_hot_codes, STATE.names, self.on_tick, STATE.runtime), daemon=True).start()
-        BOT.send(f"🚀 <b>이핀로봇 V{SETTINGS.version} 기동 완료!</b>\n\n- 초경량 수급 폭발 감시 활성화\n- 로컬 JSON 메모리 시스템 로드 완료\n- AI 모닝 브리핑 탑재 완료")
+        BOT.send(f"🚀 <b>이핀로봇 V{SETTINGS.version} 기동 완료!</b>\n\n- 실시간 현재가 및 수익률 연동 완료\n- 초경량 수급 폭발 감시 활성화\n- AI 모닝 브리핑 탑재 완료")
 
 APP = App()
 
