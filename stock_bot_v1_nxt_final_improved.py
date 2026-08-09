@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 쾌걸스민 V3.1.2 (The Absolute Zenith)
+# 🤖 쾌걸스민 V3.1.2 (The Absolute Zenith / 통합 완성본)
 # 1. 텔레그램 실시간 전광판 (10초 주기 Live Dashboard)
 # 2. 자연어 매매 지시 파싱 (Gemini JSON 구조화)
 # 3. MTS 호가창 다이렉트 딥링크 버튼 추가
 # 4. 차트 즉석 렌더링 + 찌라시 판독 + 서킷브레이커
-# 5. [안정화] in_session 함수 복구 및 KIS 웹소켓 DDoS 방지(0.25초) 패치
+# 5. [안정화] in_session 함수 및 KIS 웹소켓 DDoS 방지 패치
+# 6. [UX] /도움말 매뉴얼 기능 완벽 통합
 # ==========================================
 
 import os, json, time, threading, queue, logging, io
@@ -52,7 +53,7 @@ def in_session(sh, eh):
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '3.1.2 (The Zenith Stable)'
+    version: str = '3.1.2 (The Zenith Final)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -246,12 +247,20 @@ class KIS:
                         ts = now().replace(hour=int(f[1][:2]), minute=int(f[1][2:4]), second=0, microsecond=0)
                         on_tick(c, num(f[2]), int(f[12] or 0), num(f[18]), ts)
                 
-                # [패치됨] DDoS 오인 방지(0.25초 딜레이)
                 def on_open(ws):
+                    log.info("Websocket connected")
                     def _subscribe():
                         for c in STATE.candidates[:40]:
-                            ws.send(json.dumps({'header': {'approval_key': appr, 'custtype': 'P', 'tr_type': '1', 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': SETTINGS.nxt_trade_tr, 'tr_key': c}}}))
-                            time.sleep(0.25) 
+                            try:
+                                if ws.sock and ws.sock.connected:
+                                    ws.send(json.dumps({'header': {'approval_key': appr, 'custtype': 'P', 'tr_type': '1', 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': SETTINGS.nxt_trade_tr, 'tr_key': c}}}))
+                                    time.sleep(0.25) 
+                                else:
+                                    log.warning("서버에 의해 웹소켓이 끊어져 구독 루프를 중단합니다.")
+                                    break
+                            except Exception as e:
+                                log.warning(f"구독 요청 중단: {e}")
+                                break
                     threading.Thread(target=_subscribe, daemon=True).start()
                     
                 ws = websocket.WebSocketApp(self.ws, on_open=on_open, on_message=on_msg)
@@ -464,22 +473,49 @@ class App:
             except: pass
 
     def handle_text(self, txt, chat):
+        # 1. 리모컨 매핑
         if txt == "☀️ 아침 브리핑 호출": WORKER.submit(self.run_morning_ai); return
         elif txt == "🌙 야간 브리핑 호출": WORKER.submit(self.run_night_ai); return
         elif txt == "🛑 모든 방어선 해제":
             POSITIONS.data.clear(); POSITIONS.save(); BOT.send("🛑 모든 감시와 방어선이 해제되었습니다.", chat); return
         
         p = txt.split(); cmd = p[0]
-        if cmd == '/상태': pass
+        # 2. 수동 명령어
+        if cmd == '/상태': pass 
         elif cmd == '/매도' and len(p) >= 2:
             c = "".join(p[1:])
             for code, name in STATE.names.items():
                 if c in name or c == code:
                     if POSITIONS.remove(code): BOT.send(f"✅ {name} 감시 종료.", chat)
                     return
+        elif cmd in ['/도움말', '/help', '도움말', '?']:
+            help_text = """
+🤖 <b>[쾌걸스민 V3.1.2 사용 매뉴얼]</b>
+
+<b>1. 🕹️ 하단 전용 리모컨</b>
+입력창 밑의 버튼을 누르시면 됩니다.
+• [아침/야간 브리핑]: AI 시황 즉시 호출
+• [모든 방어선 해제]: 감시 중인 전 종목 락 해제
+
+<b>2. 🗣️ 자연어 매매 지시 (카톡하듯 대화)</b>
+명령어 없이 편하게 치세요! (Gemini AI 파싱)
+<i>예) "스민아 에코프로 10만원에 샀어 방어해"</i>
+
+<b>3. 🎯 타점 포착 시 (1-Click 감시)</b>
+스나이퍼 시그널이 오면 메시지 하단의
+<b>[💰 현재가 방어선 구축]</b> 버튼을 터치하세요!
+봇이 즉각 트레일링 스탑 감시를 시작합니다.
+
+<b>4. ⌨️ 수동 명령어 (예비용)</b>
+• <code>/매도 [종목명]</code> : 특정 종목만 감시 종료
+• <code>/도움말</code> : 이 매뉴얼 다시 보기
+"""
+            BOT.send(help_text.strip(), chat)
+
+        # 3. 자연어 매매 지시 AI 파싱
         elif not cmd.startswith('/'):
             if not self.parse_nlp_command(txt, chat):
-                BOT.send("🤔 명령을 이해하지 못했습니다. (예: 삼성전자 8만원 방어해)", chat)
+                BOT.send("🤔 명령을 이해하지 못했습니다.\n(매뉴얼을 보려면 '/도움말'을 입력하세요.)", chat)
 
     def start(self):
         WORKER.start(); POSITIONS.load(); BOT.text_handler = self.handle_text; BOT.callback_handler = self.handle_callback
@@ -488,11 +524,11 @@ class App:
         STATE.load_candidates()
         if in_session("08:00", "15:30"): self.sync_bars()
         threading.Thread(target=KIS_CLIENT.stream, args=(self.on_tick,), daemon=True).start()
-        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n이제 채팅창 상단에 실시간 전광판이 켜집니다.")
+        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n이제 채팅창 상단에 실시간 전광판이 켜집니다. (매뉴얼: /도움말)")
 
 APP = App(); web = Flask(__name__)
 @web.get('/')
-def root(): return 'Kkwaegeol Seumin V3.1.2 Zenith Stable', 200
+def root(): return 'Kkwaegeol Seumin V3.1.2 Zenith Final', 200
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: (time.sleep(2), APP.start()), daemon=True).start()
