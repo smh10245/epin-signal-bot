@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 쾌걸스민 V3.1.1 (The Absolute Zenith / Hotfix)
+# 🤖 쾌걸스민 V3.1.2 (The Absolute Zenith)
 # 1. 텔레그램 실시간 전광판 (10초 주기 Live Dashboard)
 # 2. 자연어 매매 지시 파싱 (Gemini JSON 구조화)
 # 3. MTS 호가창 다이렉트 딥링크 버튼 추가
 # 4. 차트 즉석 렌더링 + 찌라시 판독 + 서킷브레이커
-# [Hotfix] in_session 함수 누락 버그 패치 완료
+# 5. [안정화] in_session 함수 복구 및 KIS 웹소켓 DDoS 방지(0.25초) 패치
 # ==========================================
 
 import os, json, time, threading, queue, logging, io
@@ -33,7 +33,7 @@ except ImportError:
 
 KST = ZoneInfo('Asia/Seoul')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger('seumin.v311')
+log = logging.getLogger('seumin.v312')
 
 # ===== 1. 유틸리티 함수 =====
 def now(): return datetime.now(KST)
@@ -42,7 +42,6 @@ def num(v, d=0.0):
     except: return d
 def pct(n, o): return (n / o - 1) * 100 if o else 0
 
-# [Hotfix] 누락되었던 장중 시간 판별 함수 복구
 def in_session(sh, eh):
     n = now()
     if n.weekday() >= 5: return False
@@ -53,7 +52,7 @@ def in_session(sh, eh):
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '3.1.1 (The Zenith Hotfix)'
+    version: str = '3.1.2 (The Zenith Stable)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -219,20 +218,25 @@ class KIS:
     def __init__(self):
         self.rest = 'https://openapi.koreainvestment.com:9443'; self.ws = 'ws://ops.koreainvestment.com:21000'
         self.s = requests.Session(); self.token = None; self.token_exp = None
+    
     def auth(self):
         if not self.token or now() > self.token_exp:
             r = self.s.post(f'{self.rest}/oauth2/tokenP', json={'grant_type': 'client_credentials', 'appkey': SETTINGS.kis_app_key, 'appsecret': SETTINGS.kis_app_secret}).json()
             self.token = r['access_token']; self.token_exp = now() + timedelta(seconds=int(r['expires_in'])-300)
         return self.token
+    
     def get_bars(self, code):
         try:
             r = self.s.get(f'{self.rest}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice', headers={'authorization': f'Bearer {self.auth()}', 'appkey': SETTINGS.kis_app_key, 'appsecret': SETTINGS.kis_app_secret, 'tr_id': 'FHKST03010200', 'custtype': 'P'}, params={'FID_ETC_CLS_CODE': '', 'FID_COND_MRKT_DIV_CODE': 'J', 'FID_INPUT_ISCD': code, 'FID_INPUT_HOUR_1': '153000', 'FID_PW_DATA_INCU_YN': 'Y'})
             return r.json().get('output2') or []
         except: return []
+    
     def stream(self, on_tick):
         while True:
             try:
-                appr = self.s.post(f'{self.rest}/oauth2/Approval', json={'grant_type': 'client_credentials', 'appkey': SETTINGS.kis_app_key, 'secretkey': SETTINGS.kis_app_secret}).json()['approval_key']
+                appr_res = self.s.post(f'{self.rest}/oauth2/Approval', json={'grant_type': 'client_credentials', 'appkey': SETTINGS.kis_app_key, 'secretkey': SETTINGS.kis_app_secret}).json()
+                appr = appr_res.get('approval_key')
+                
                 def on_msg(ws, msg):
                     if isinstance(msg, bytes): msg = msg.decode('utf-8')
                     if 'PINGPONG' in msg: ws.send(msg); return
@@ -241,9 +245,20 @@ class KIS:
                         f = p[3].split('^'); c = f[0].zfill(6)
                         ts = now().replace(hour=int(f[1][:2]), minute=int(f[1][2:4]), second=0, microsecond=0)
                         on_tick(c, num(f[2]), int(f[12] or 0), num(f[18]), ts)
-                ws = websocket.WebSocketApp(self.ws, on_open=lambda w: [w.send(json.dumps({'header': {'approval_key': appr, 'custtype': 'P', 'tr_type': '1', 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': SETTINGS.nxt_trade_tr, 'tr_key': c}}})) for c in STATE.candidates[:40]], on_message=on_msg)
+                
+                # [패치됨] DDoS 오인 방지(0.25초 딜레이)
+                def on_open(ws):
+                    def _subscribe():
+                        for c in STATE.candidates[:40]:
+                            ws.send(json.dumps({'header': {'approval_key': appr, 'custtype': 'P', 'tr_type': '1', 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': SETTINGS.nxt_trade_tr, 'tr_key': c}}}))
+                            time.sleep(0.25) 
+                    threading.Thread(target=_subscribe, daemon=True).start()
+                    
+                ws = websocket.WebSocketApp(self.ws, on_open=on_open, on_message=on_msg)
                 ws.run_forever(ping_interval=25, ping_timeout=10)
-            except: time.sleep(10)
+            except Exception as e: 
+                log.error(f"WS 에러: {e}"); time.sleep(10)
+
 KIS_CLIENT = KIS()
 
 class Brain:
@@ -477,7 +492,7 @@ class App:
 
 APP = App(); web = Flask(__name__)
 @web.get('/')
-def root(): return 'Kkwaegeol Seumin V3.1.1 Zenith Hotfix', 200
+def root(): return 'Kkwaegeol Seumin V3.1.2 Zenith Stable', 200
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: (time.sleep(2), APP.start()), daemon=True).start()
