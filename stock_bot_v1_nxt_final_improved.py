@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 쾌걸스민 V3.0 (The Free-Tier God / 무과금 끝판왕)
-# 1. 텔레그램 실시간 1분봉 차트(PNG) 즉석 렌더링 & 전송
-# 2. 타점 포착 시 Gemini 즉석 상승 이유(찌라시) 판독 결합
-# 3. 1-Click 다중 비중 방어선(인라인 키보드) UI
-# 4. 극한의 메모리 최적화 (512MB Render 생존 보장)
+# 🤖 쾌걸스민 V3.1.1 (The Absolute Zenith / Hotfix)
+# 1. 텔레그램 실시간 전광판 (10초 주기 Live Dashboard)
+# 2. 자연어 매매 지시 파싱 (Gemini JSON 구조화)
+# 3. MTS 호가창 다이렉트 딥링크 버튼 추가
+# 4. 차트 즉석 렌더링 + 찌라시 판독 + 서킷브레이커
+# [Hotfix] in_session 함수 누락 버그 패치 완료
 # ==========================================
 
 import os, json, time, threading, queue, logging, io
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 import requests, websocket
 import pandas as pd
@@ -21,7 +21,6 @@ import yfinance as yf
 from flask import Flask, jsonify
 from zoneinfo import ZoneInfo
 
-# [추가됨] 무과금 차트 렌더링을 위한 라이브러리 (서버 메모리 절약을 위해 Agg 백엔드 사용)
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
@@ -34,17 +33,27 @@ except ImportError:
 
 KST = ZoneInfo('Asia/Seoul')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger('seumin.v3')
+log = logging.getLogger('seumin.v311')
 
+# ===== 1. 유틸리티 함수 =====
 def now(): return datetime.now(KST)
 def num(v, d=0.0):
     try: return float(str(v).replace(',', '').replace('원', '').replace('주', '').strip())
     except: return d
 def pct(n, o): return (n / o - 1) * 100 if o else 0
 
+# [Hotfix] 누락되었던 장중 시간 판별 함수 복구
+def in_session(sh, eh):
+    n = now()
+    if n.weekday() >= 5: return False
+    try:
+        sh_h, sh_m = map(int, sh.split(':')); eh_h, eh_m = map(int, eh.split(':'))
+        return n.replace(hour=sh_h, minute=sh_m, second=0, microsecond=0) <= n <= n.replace(hour=eh_h, minute=eh_m, second=0, microsecond=0)
+    except: return False
+
 @dataclass(frozen=True)
 class Settings:
-    version: str = '3.0 (무과금 끝판왕)'
+    version: str = '3.1.1 (The Zenith Hotfix)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -77,6 +86,7 @@ class AsyncWorker:
             finally: self.q.task_done()
 
 WORKER = AsyncWorker('worker')
+
 class LocalDB:
     def __init__(self):
         self.pos_file = 'seumin_positions.json'
@@ -100,30 +110,33 @@ class LocalDB:
 DB = LocalDB()
 
 class Telegram:
-    def __init__(self): self.s = requests.Session(); self.offset = 0; self.text_handler = None; self.callback_handler = None
+    def __init__(self): 
+        self.s = requests.Session(); self.offset = 0
+        self.text_handler = None; self.callback_handler = None
+        self.dashboard_msg_id = None
     
     @property
     def default_markup(self):
         return {
-            "keyboard": [[{"text": "📊 봇 상태 확인"}, {"text": "💼 내 계좌 방어선"}], [{"text": "☀️ 아침 브리핑 호출"}, {"text": "🌙 야간 브리핑 호출"}]],
+            "keyboard": [[{"text": "☀️ 아침 브리핑 호출"}, {"text": "🌙 야간 브리핑 호출"}], [{"text": "🛑 모든 방어선 해제"}]],
             "resize_keyboard": True
         }
 
     def send(self, text, chat=None, reply_markup=None): 
         def _send():
             payload = {'chat_id': str(chat or SETTINGS.chat_id).strip(), 'text': text, 'parse_mode': 'HTML', 'reply_markup': reply_markup or self.default_markup}
-            try: self.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/sendMessage', json=payload, timeout=10)
-            except: pass
-        WORKER.submit(_send)
+            try: 
+                r = self.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/sendMessage', json=payload, timeout=10).json()
+                return r.get('result', {}).get('message_id')
+            except: return None
+        return _send() 
 
-    # [핵심 V3.0] 사진(차트) 전송 기능 추가
     def send_photo(self, photo_io, caption, chat=None, reply_markup=None):
         def _send_photo():
             url = f'https://api.telegram.org/bot{SETTINGS.telegram_token}/sendPhoto'
             data = {'chat_id': str(chat or SETTINGS.chat_id).strip(), 'caption': caption, 'parse_mode': 'HTML'}
             if reply_markup: data['reply_markup'] = json.dumps(reply_markup)
-            try: 
-                self.s.post(url, data=data, files={'photo': ('chart.png', photo_io, 'image/png')}, timeout=15)
+            try: self.s.post(url, data=data, files={'photo': ('chart.png', photo_io, 'image/png')}, timeout=15)
             except Exception as e: log.error(f"사진 전송 에러: {e}")
         WORKER.submit(_send_photo)
 
@@ -282,36 +295,59 @@ class App:
                     q.append(Bar(m, num(r['stck_oprc']), num(r['stck_hgpr']), num(r['stck_lwpr']), num(r['stck_prpr']), int(r['cntg_vol']), 100))
                     if c in STATE.index_etfs and STATE.index_opens[c] == 0: STATE.index_opens[c] = num(r['stck_oprc'])
 
-    # [핵심 V3.0] 극한의 메모리 최적화 차트 생성기
     def generate_chart_io(self, c, vwap):
         try:
-            bars = list(STATE.bars.get(c, []))[-60:] # 최근 1시간만 (메모리 절약)
+            bars = list(STATE.bars.get(c, []))[-60:]
             if not bars: return None
             times = [b.minute.strftime('%H:%M') for b in bars]; prices = [b.close for b in bars]
-            
             plt.figure(figsize=(6, 3))
             plt.plot(times, prices, color='red', linewidth=1.5, label='Price')
             plt.axhline(y=vwap, color='blue', linestyle='--', linewidth=1, label='VWAP (Support)')
             plt.xticks(times[::10], rotation=45); plt.grid(True, alpha=0.3); plt.legend(loc='upper right')
             plt.tight_layout()
-            
             buf = io.BytesIO()
             plt.savefig(buf, format='png', dpi=100); buf.seek(0)
-            
-            plt.clf(); plt.close('all') # 메모리 강제 삭제 (매우 중요)
+            plt.clf(); plt.close('all') 
             return buf
-        except Exception as e:
-            log.error(f"차트 렌더링 실패: {e}")
-            plt.close('all'); return None
+        except: plt.close('all'); return None
 
-    # [핵심 V3.0] Gemini 즉석 찌라시 판독기
-    def get_instant_ai_reason(self, name):
-        if not HAS_GEMINI or not SETTINGS.gemini_api_key: return "AI 키 누락으로 판독 불가"
+    def update_dashboard(self):
+        cb_status = '발동됨🚨' if STATE.circuit_breaker else '정상🟢'
+        msg = f"📊 <b>[쾌걸스민 LIVE 전광판]</b> {now().strftime('%H:%M:%S')}\n"
+        msg += f"서킷브레이커: {cb_status} | 금일 포착: {len(self.sent)}건\n\n"
+        msg += "💼 <b>[방어 중인 종목]</b>\n"
+        if not POSITIONS.data: msg += "  └ 관망 중\n"
+        else:
+            for c, pos in POSITIONS.data.items():
+                curr = STATE.bars[c][-1].close if STATE.bars.get(c) else pos.entry
+                gain = pct(curr, pos.entry)
+                msg += f"• <b>{pos.name}</b>: {curr:,.0f}원 ({gain:+.2f}%) | 🛡️ {pos.stop:,.0f}원\n"
+        if BOT.dashboard_msg_id is None:
+            BOT.dashboard_msg_id = BOT.send(msg)
+        else:
+            BOT.edit_message(SETTINGS.chat_id, BOT.dashboard_msg_id, msg)
+
+    def parse_nlp_command(self, txt, chat_id):
+        if not HAS_GEMINI or not SETTINGS.gemini_api_key: return False
         try:
             genai.configure(api_key=SETTINGS.gemini_api_key)
-            prompt = f"현재 한국 주식시장에서 '{name}' 주식이 거래량이 터지며 급등 중이야. 오늘 이 주식이 속한 테마나 최근 이슈(찌라시)를 기반으로 상승 이유를 딱 1줄로 짧게 추정해봐."
-            return genai.GenerativeModel('gemini-2.5-flash').generate_content(prompt).text.strip()
-        except: return "일시적 수급 쏠림 추정"
+            prompt = f"""
+            사용자가 봇에게 지시를 내렸어: "{txt}"
+            매수했으니 감시하라는 뜻인지 판단해 종목명과 가격을 추출해. JSON만 대답.
+            예시: "에코프로 10만원 방어해" -> {{"action": "buy", "stock": "에코프로", "price": 100000}}
+            """
+            model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
+            res = model.generate_content(prompt).text
+            data = json.loads(res)
+            if data.get('action') == 'buy':
+                s_name = data.get('stock'); price = float(data.get('price', 0))
+                for code, name in STATE.names.items():
+                    if s_name in name or s_name == name:
+                        pos = POSITIONS.register(code, name, price, 1)
+                        BOT.send(f"🤖 <b>[자연어 접수]</b> {name} 방어선({pos.stop:,.0f}원) 구축 완료!", chat_id)
+                        return True
+            return False
+        except: return False
 
     def on_tick(self, c, p, v, ts, m):
         with STATE.lock:
@@ -336,22 +372,18 @@ class App:
                     self.sent.add(c)
                     name = STATE.names.get(c, c)
                     
-                    # 1. 찌라시 즉석 판독 (Thread Blocking 방지를 위해 여기서 호출)
-                    ai_reason = self.get_instant_ai_reason(name)
-                    
-                    # 2. 1-Click 다중 방어선 버튼 UI
+                    deep_link = f"https://m.stock.naver.com/domestic/stock/{c}/total"
                     inline_kb = {"inline_keyboard": [
-                        [{"text": f"💰 100만 원 (1차 방어선)", "callback_data": f"buy_{c}_{price}"}],
-                        [{"text": f"💰 500만 원 (비중 확대)", "callback_data": f"buy_{c}_{price}"}],
+                        [{"text": f"📈 네이버/MTS 차트 바로가기", "url": deep_link}],
+                        [{"text": f"💰 현재가({price:,.0f}원) 방어선 구축", "callback_data": f"buy_{c}_{price}"}],
                         [{"text": "🗑️ 차트 구림 (관망)", "callback_data": f"pass_{c}"}]
                     ]}
                     
-                    caption = f"🔫 <b>[쾌걸스민 즉석 포착] {name}</b> ({c})\n\n💰 <b>VWAP 맥점:</b> {price:,.0f}원\n🛡️ <b>동적 손절선:</b> {vwap_stop:,.0f}원\n\n🤖 <b>AI 찌라시 판독:</b>\n{ai_reason}\n\n👇 <i>HTS 매수 후 아래 버튼 터치!</i>"
+                    caption = f"🔫 <b>[쾌걸스민 즉석 포착] {name}</b> ({c})\n\n💰 <b>VWAP 맥점:</b> {price:,.0f}원\n🛡️ <b>동적 손절선:</b> {vwap_stop:,.0f}원\n\n👇 <i>차트 확인 후 버튼을 누르세요</i>"
                     
-                    # 3. 차트 렌더링 및 텔레그램 발송
                     chart_io = self.generate_chart_io(c, vwap_val)
                     if chart_io: BOT.send_photo(chart_io, caption, reply_markup=inline_kb)
-                    else: BOT.send(caption, reply_markup=inline_kb) # 차트 실패 시 텍스트만
+                    else: BOT.send(caption, reply_markup=inline_kb) 
 
     def run_night_ai(self):
         top_txt = ", ".join([n for _, n in STATE.top_20_list]) or "데이터 없음"
@@ -377,9 +409,15 @@ class App:
 
     def scheduler(self):
         done = {}
+        last_dash_update = 0
         while True:
             n = now(); d = str(n.date())
             if self.today != d: self.today = d; self.sent.clear(); STATE.circuit_breaker = False
+            
+            if time.time() - last_dash_update > 10:
+                WORKER.submit(self.update_dashboard)
+                last_dash_update = time.time()
+
             if n.weekday() < 5:
                 if n.hour == 7 and done.get('m_ai') != d: WORKER.submit(self.run_morning_ai); done['m_ai'] = d
                 if n.hour == 9 and done.get('sync') != d: WORKER.submit(self.sync_bars); done['sync'] = d
@@ -388,7 +426,7 @@ class App:
                     txt = "\n".join([f"• {n} ({c}): {p:,.0f}원" for c, n, p in picks]) or "조건 만족 없음"
                     BOT.send(f"🌇 <b>[쾌걸스민 종배 3선]</b>\n\n{txt}"); done['close'] = d
                 if n.hour == 22 and done.get('n_ai') != d: WORKER.submit(self.run_night_ai); done['n_ai'] = d
-            time.sleep(20)
+            time.sleep(2) 
 
     def handle_callback(self, cb):
         cb_id = cb['id']; data = cb.get('data', ''); msg = cb.get('message', {})
@@ -399,35 +437,34 @@ class App:
             POSITIONS.register(c, name, price, 1) 
             BOT.answer_callback(cb_id, text=f"✅ {name} 방어선 구축 완료!")
             orig_text = msg.get('caption', '') or msg.get('text', '')
-            new_text = orig_text.replace("👇 HTS 매수 후 아래 버튼 터치!", f"✅ <b>[방어선 가동 중]</b> 기준가: {price:,.0f}원")
-            # 사진 메시지 캡션 수정
+            new_text = orig_text.replace("👇 차트 확인 후 버튼을 누르세요", f"✅ <b>[방어선 가동 중]</b> 기준가: {price:,.0f}원")
             try: BOT.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/editMessageCaption', json={'chat_id': str(chat_id), 'message_id': msg_id, 'caption': new_text, 'parse_mode': 'HTML'})
             except: pass
             
         elif data.startswith('pass_'):
             BOT.answer_callback(cb_id, text="🗑️ 관망합니다.")
             orig_text = msg.get('caption', '') or msg.get('text', '')
-            new_text = orig_text.replace("👇 HTS 매수 후 아래 버튼 터치!", "🗑️ <b>[스팸 락 / 관망 패스]</b>")
+            new_text = orig_text.replace("👇 차트 확인 후 버튼을 누르세요", "🗑️ <b>[스팸 락 / 관망 패스]</b>")
             try: BOT.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/editMessageCaption', json={'chat_id': str(chat_id), 'message_id': msg_id, 'caption': new_text, 'parse_mode': 'HTML'})
             except: pass
 
     def handle_text(self, txt, chat):
-        if txt == "📊 봇 상태 확인": txt = "/상태"
-        elif txt == "💼 내 계좌 방어선": txt = "/보유"
-        elif txt == "☀️ 아침 브리핑 호출": WORKER.submit(self.run_morning_ai); return
+        if txt == "☀️ 아침 브리핑 호출": WORKER.submit(self.run_morning_ai); return
         elif txt == "🌙 야간 브리핑 호출": WORKER.submit(self.run_night_ai); return
+        elif txt == "🛑 모든 방어선 해제":
+            POSITIONS.data.clear(); POSITIONS.save(); BOT.send("🛑 모든 감시와 방어선이 해제되었습니다.", chat); return
         
         p = txt.split(); cmd = p[0]
-        if cmd == '/상태': BOT.send(f"🤖 쾌걸스민 V3.0 가동\n- 무과금 차트 엔진 ON\n- AI 찌라시 즉석 판독 ON\n- 서킷브레이커: {'발동🚨' if STATE.circuit_breaker else '정상🟢'}", chat)
-        elif cmd == '/보유':
-            if not POSITIONS.data: BOT.send("📭 방어 중인 종목이 없습니다.", chat)
-            else:
-                msg = "💼 <b>[내 계좌 방어 현황]</b>\n\n"
-                for c, pos in POSITIONS.data.items():
-                    curr = STATE.bars[c][-1].close if STATE.bars.get(c) else pos.entry
-                    gain = pct(curr, pos.entry)
-                    msg += f"• <b>{pos.name}</b> (진입: {pos.entry:,.0f})\n  현재: {curr:,.0f} ({gain:+.2f}%) | 🛡️ 방어: {pos.stop:,.0f}\n"
-                BOT.send(msg, chat)
+        if cmd == '/상태': pass
+        elif cmd == '/매도' and len(p) >= 2:
+            c = "".join(p[1:])
+            for code, name in STATE.names.items():
+                if c in name or c == code:
+                    if POSITIONS.remove(code): BOT.send(f"✅ {name} 감시 종료.", chat)
+                    return
+        elif not cmd.startswith('/'):
+            if not self.parse_nlp_command(txt, chat):
+                BOT.send("🤔 명령을 이해하지 못했습니다. (예: 삼성전자 8만원 방어해)", chat)
 
     def start(self):
         WORKER.start(); POSITIONS.load(); BOT.text_handler = self.handle_text; BOT.callback_handler = self.handle_callback
@@ -436,11 +473,11 @@ class App:
         STATE.load_candidates()
         if in_session("08:00", "15:30"): self.sync_bars()
         threading.Thread(target=KIS_CLIENT.stream, args=(self.on_tick,), daemon=True).start()
-        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n무과금의 한계를 넘었습니다. 하단 리모컨을 눌러보십시오.")
+        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n이제 채팅창 상단에 실시간 전광판이 켜집니다.")
 
 APP = App(); web = Flask(__name__)
 @web.get('/')
-def root(): return 'Kkwaegeol Seumin V3.0 God-Tier Running', 200
+def root(): return 'Kkwaegeol Seumin V3.1.1 Zenith Hotfix', 200
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: (time.sleep(2), APP.start()), daemon=True).start()
