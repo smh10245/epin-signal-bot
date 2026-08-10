@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 쾌걸스민 V3.1.5 (The Absolute Zenith - BEAST MODE)
-# 1. [BEAST MODE] NXT 12시간(08:00~20:00) 풀타임 스나이퍼 개방
-# 2. 텔레그램 실시간 전광판 (10초 주기 Live Dashboard)
-# 3. 자연어 매매 지시 파싱 (Gemini JSON 구조화)
-# 4. 네이버 금융 백도어 우회 (KRX 차단 완벽 해결)
-# 5. KIS 웹소켓 DDoS 방어 우회 패치 (0.25초)
+# 🤖 쾌걸스민 V4 (VIP Intensive Sniper Mode)
+# 1. 5~10개 소수 정예 집중 감시 (동적 추가/삭제)
+# 2. 매수 직후 3단계 집중 관리 (원금 절대방어 -> 트레일링)
+# 3. 네이버/KRX 크롤링 완전 폐기 (IP 차단 원천 봉쇄)
+# 4. 극한의 텔레그램 자연어 UI/UX 적용
+# 5. [BEAST MODE] NXT 12시간(08~20시) 풀타임 감시
 # ==========================================
 
-import os, json, time, threading, queue, logging, io
+import os, json, time, threading, queue, logging, io, urllib.parse
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from dataclasses import dataclass
 
 import requests, websocket
-import pandas as pd
-import FinanceDataReader as fdr
 import yfinance as yf
 from flask import Flask, jsonify
 from zoneinfo import ZoneInfo
@@ -33,26 +31,28 @@ except ImportError:
 
 KST = ZoneInfo('Asia/Seoul')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger('seumin.beast')
+log = logging.getLogger('seumin.v4')
 
-# ===== 1. 유틸리티 함수 =====
+# ===== 유틸리티 =====
 def now(): return datetime.now(KST)
 def num(v, d=0.0):
     try: return float(str(v).replace(',', '').replace('원', '').replace('주', '').strip())
     except: return d
 def pct(n, o): return (n / o - 1) * 100 if o else 0
 
-def in_session(sh, eh):
-    n = now()
-    if n.weekday() >= 5: return False
+# 네이버 자동완성 API를 활용한 초고속 종목코드 검색 (IP 차단 없음)
+def get_stock_code(name):
     try:
-        sh_h, sh_m = map(int, sh.split(':')); eh_h, eh_m = map(int, eh.split(':'))
-        return n.replace(hour=sh_h, minute=sh_m, second=0, microsecond=0) <= n <= n.replace(hour=eh_h, minute=eh_m, second=0, microsecond=0)
-    except: return False
+        url = f"https://ac.finance.naver.com/ac?q={urllib.parse.quote(name)}&q_enc=euc-kr&st=111&r_format=json"
+        res = requests.get(url, timeout=5).json()
+        items = res.get('items', [[]])[0]
+        if items: return items[0][1], items[0][0] # code, exact_name
+    except: pass
+    return None, None
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '3.1.5 (Beast Mode)'
+    version: str = '4.0.0 (VIP Sniper)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -60,8 +60,6 @@ class Settings:
     kis_app_secret: str = os.getenv('KIS_APP_SECRET', '').strip()
     kis_env: str = os.getenv('KIS_ENV', 'real').strip().lower()
     port: int = int(os.getenv('PORT', 10000))
-    min_market_cap: float = 100_000_000_000  
-    min_daily_volume: int = 20_000
     circuit_breaker_pct: float = -1.5        
     nxt_trade_tr: str = os.getenv('KIS_NXT_TRADE_TR_ID', 'H0NXCNT0')
 
@@ -70,7 +68,7 @@ SETTINGS = Settings()
 @dataclass
 class Bar: minute: datetime; open: float; high: float; low: float; close: float; volume: int; trade_strength: float
 @dataclass
-class Position: name: str; entry: float; qty: float; highest: float; stop: float
+class Position: name: str; entry: float; qty: float; highest: float; stop: float; level: int = 0
 
 class AsyncWorker:
     def __init__(self, name):
@@ -89,22 +87,17 @@ WORKER = AsyncWorker('worker')
 class LocalDB:
     def __init__(self):
         self.pos_file = 'seumin_positions.json'
-        self.ai_file = 'seumin_ai_memory.json'
+        self.vip_file = 'seumin_vip.json'
     def load_pos(self):
-        try:
-            if os.path.exists(self.pos_file):
-                with open(self.pos_file, 'r', encoding='utf-8') as f: return json.load(f)
-        except: pass
+        if os.path.exists(self.pos_file): return json.load(open(self.pos_file, 'r', encoding='utf-8'))
         return {}
     def save_pos(self, data):
         WORKER.submit(lambda: json.dump(data, open(self.pos_file, 'w', encoding='utf-8'), ensure_ascii=False))
-    def load_ai(self):
-        try:
-            if os.path.exists(self.ai_file): return json.load(open(self.ai_file, 'r', encoding='utf-8')).get('picks', '데이터 없음')
-        except: pass
-        return "데이터 없음"
-    def save_ai(self, text):
-        WORKER.submit(lambda: json.dump({'picks': text}, open(self.ai_file, 'w', encoding='utf-8'), ensure_ascii=False))
+    def load_vip(self):
+        if os.path.exists(self.vip_file): return json.load(open(self.vip_file, 'r', encoding='utf-8'))
+        return {"limit": 5, "targets": {"119850": "지엔씨에너지"}} # 기본 타겟
+    def save_vip(self, data):
+        WORKER.submit(lambda: json.dump(data, open(self.vip_file, 'w', encoding='utf-8'), ensure_ascii=False))
 
 DB = LocalDB()
 
@@ -117,16 +110,17 @@ class Telegram:
     @property
     def default_markup(self):
         return {
-            "keyboard": [[{"text": "☀️ 아침 브리핑 호출"}, {"text": "🌙 야간 브리핑 호출"}], [{"text": "🛑 모든 방어선 해제"}]],
+            "keyboard": [
+                [{"text": "📊 타겟 현황 / 대시보드"}, {"text": "📰 VIP 타겟 뉴스/공시"}],
+                [{"text": "🛑 모든 방어선 해제"}, {"text": "📖 매뉴얼 보기"}]
+            ],
             "resize_keyboard": True
         }
 
     def send(self, text, chat=None, reply_markup=None): 
         def _send():
             payload = {'chat_id': str(chat or SETTINGS.chat_id).strip(), 'text': text, 'parse_mode': 'HTML', 'reply_markup': reply_markup or self.default_markup}
-            try: 
-                r = self.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/sendMessage', json=payload, timeout=10).json()
-                return r.get('result', {}).get('message_id')
+            try: return self.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/sendMessage', json=payload, timeout=10).json().get('result', {}).get('message_id')
             except: return None
         return _send() 
 
@@ -136,7 +130,7 @@ class Telegram:
             data = {'chat_id': str(chat or SETTINGS.chat_id).strip(), 'caption': caption, 'parse_mode': 'HTML'}
             if reply_markup: data['reply_markup'] = json.dumps(reply_markup)
             try: self.s.post(url, data=data, files={'photo': ('chart.png', photo_io, 'image/png')}, timeout=15)
-            except Exception as e: log.error(f"사진 전송 에러: {e}")
+            except: pass
         WORKER.submit(_send_photo)
 
     def edit_message(self, chat_id, message_id, text, reply_markup=None):
@@ -166,59 +160,11 @@ BOT = Telegram()
 
 class SeuminState:
     def __init__(self):
-        self.lock = threading.RLock(); self.names = {}; self.meta = {}; self.candidates = []; self.bars = {}; self.top_20_list = []; self.circuit_breaker = False
+        self.lock = threading.RLock(); self.bars = {}; self.circuit_breaker = False
         self.index_etfs = {'069500': 'KOSPI', '226490': 'KOSDAQ'}; self.index_opens = {'069500': 0, '226490': 0}
-
-    def load_candidates(self):
-        try:
-            log.info("KRX 방화벽 우회: 네이버 API(거래대금 상위) 로드 시도...")
-            temp_list = []
-            for market in ['KOSPI', 'KOSDAQ']:
-                url = f"https://m.stock.naver.com/api/stocks/topAmount/{market}?page=1&pageSize=100"
-                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 Windows NT 10.0'}, timeout=10).json()
-                for s in res.get('stocks', []):
-                    c = s.get('itemCode'); n = s.get('stockName')
-                    amt = num(s.get('accumulatedTradingValue', '0'))
-                    if c and c.isdigit():
-                        self.names[c] = n
-                        temp_list.append((c, amt))
-            
-            if temp_list:
-                temp_list.sort(key=lambda x: x[1], reverse=True) 
-                with self.lock:
-                    self.top_20_list = [(c, self.names[c]) for c, _ in temp_list[:20]]
-                    self.candidates = list(self.index_etfs.keys()) + [c for c, _ in temp_list if c not in self.index_etfs][:198]
-                log.info(f"✅ 네이버 백도어 로드 완벽 성공! (감시 대상 주도주: {len(self.candidates)}개)")
-                return
-        except Exception as e:
-            log.warning(f"네이버 우회 로드 실패: {e}")
-
-        for attempt in range(5):
-            try:
-                log.info(f"KRX 공식 데이터 로드 재시도 ({attempt+1}/5)...")
-                df = pd.concat([fdr.StockListing('KOSPI'), fdr.StockListing('KOSDAQ')], ignore_index=True)
-                with self.lock:
-                    valid = []
-                    for _, r in df.iterrows():
-                        c = str(r.get('Code') or r.get('Symbol')).zfill(6); n = str(r.get('Name') or c)
-                        if c in ['000000', 'nan']: continue
-                        self.names[c] = n; self.meta[c] = r
-                        cap = num(r.get('Marcap')); vol = num(r.get('Volume'))
-                        if cap < SETTINGS.min_market_cap or vol < SETTINGS.min_daily_volume: continue
-                        amt = num(r.get('Amount')) or (num(r.get('Close')) * vol)
-                        valid.append((c, amt, amt / cap if cap else 0))
-                    valid.sort(key=lambda x: x[1], reverse=True); amt_r = {x[0]: i for i, x in enumerate(valid)}
-                    valid.sort(key=lambda x: x[2], reverse=True); turn_r = {x[0]: i for i, x in enumerate(valid)}
-                    scores = [(amt_r[c]*0.5 + turn_r[c]*0.5, c, amt, turn) for c, amt, turn in valid]
-                    scores.sort()
-                    self.top_20_list = [(c, self.names[c]) for _, c, _, _ in scores[:20]]
-                    self.candidates = list(self.index_etfs.keys()) + [c for _, c, _, _ in scores[:198]]
-                log.info(f"✅ KRX 로드 성공! 감시 대상 주도주: {len(self.candidates)}개")
-                return 
-            except Exception as e:
-                log.warning(f"KRX 로드 실패: {e}"); time.sleep(3)
-        log.error("❌ 주도주 로드 최종 실패. 봇이 정상적으로 작동하지 않을 수 있습니다.")
-
+        vip_data = DB.load_vip()
+        self.vip_limit = vip_data.get('limit', 5)
+        self.vip_targets = vip_data.get('targets', {}) # {code: name}
 STATE = SeuminState()
 
 class PositionEngine:
@@ -226,19 +172,34 @@ class PositionEngine:
     def load(self): self.data = {c: Position(**v) for c, v in DB.load_pos().items()}
     def save(self): DB.save_pos({c: vars(p) for c, p in self.data.items()})
     def register(self, c, n, p, q):
-        self.data[c] = Position(n, p, q, p, p * 0.98) 
+        self.data[c] = Position(n, p, q, p, p * 0.98, 0) # 초기 손절선 -2%
         self.save(); return self.data[c]
     def remove(self, c):
         p = self.data.pop(c, None); self.save(); return p
+    
+    # [V4 패치] 3단계 집중 관리 로직
     def check_trailing(self, c, current):
         p = self.data.get(c); msg = None
         if not p: return None
         p.highest = max(p.highest, current)
         gain = pct(current, p.entry)
-        if gain >= 6: p.stop = max(p.stop, p.highest * 0.97) 
-        elif gain >= 3: p.stop = max(p.stop, p.entry * 1.01) 
+        
+        # 3단계: 고점 대비 -3% 트레일링 스탑 (수익 극대화)
+        if gain >= 6 and p.level < 2:
+            p.level = 2
+            msg = f"🔥 <b>[집중관리 3단계: 끝까지 발라먹기] {p.name}</b>\n수익률 +6% 돌파! 고점 대비 -3% 방어선을 가동합니다."
+        # 2단계: 원금 절대 방어 (본전 +1% 컷)
+        elif gain >= 3 and p.level < 1:
+            p.level = 1
+            p.stop = max(p.stop, p.entry * 1.01)
+            msg = f"🛡️ <b>[집중관리 2단계: 원금 절대방어] {p.name}</b>\n수익률 +3% 돌파! 방어선을 본전 위({p.stop:,.0f}원)로 올려 절대 손실 안 보는 락을 걸었습니다."
+
+        # 레벨 2일때는 계속 고점 따라가며 방어선 올림
+        if p.level == 2: p.stop = max(p.stop, p.highest * 0.97)
+
+        # 방어선 터치 시 청산
         if current <= p.stop:
-            msg = f"🛡️ <b>[쾌걸스민 자동 청산] {p.name}</b>\n💰 현재가: {current:,.0f}원 ({gain:+.2f}%)\n지정된 방어선을 이탈하여 감시 종료합니다."
+            msg = f"🛑 <b>[집중관리 종료: 자동 청산] {p.name}</b>\n💰 현재가: {current:,.0f}원 ({gain:+.2f}%)\n지정된 방어선({p.stop:,.0f}원)을 이탈하여 감시를 종료합니다."
             self.remove(c)
         else: self.save()
         return msg
@@ -246,8 +207,9 @@ POSITIONS = PositionEngine()
 
 class KIS:
     def __init__(self):
-        self.rest = 'https://openapi.koreainvestment.com:9443'; self.ws = 'ws://ops.koreainvestment.com:21000'
+        self.rest = 'https://openapi.koreainvestment.com:9443'; self.ws_url = 'ws://ops.koreainvestment.com:21000'
         self.s = requests.Session(); self.token = None; self.token_exp = None
+        self.ws = None; self.appr = None
     
     def auth(self):
         if not self.token or now() > self.token_exp:
@@ -260,12 +222,16 @@ class KIS:
             r = self.s.get(f'{self.rest}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice', headers={'authorization': f'Bearer {self.auth()}', 'appkey': SETTINGS.kis_app_key, 'appsecret': SETTINGS.kis_app_secret, 'tr_id': 'FHKST03010200', 'custtype': 'P'}, params={'FID_ETC_CLS_CODE': '', 'FID_COND_MRKT_DIV_CODE': 'J', 'FID_INPUT_ISCD': code, 'FID_INPUT_HOUR_1': '153000', 'FID_PW_DATA_INCU_YN': 'Y'})
             return r.json().get('output2') or []
         except: return []
-    
+
+    def subscribe(self, code, is_unsub=False):
+        if self.ws and self.ws.sock and self.ws.sock.connected and self.appr:
+            tr_type = '2' if is_unsub else '1'
+            self.ws.send(json.dumps({'header': {'approval_key': self.appr, 'custtype': 'P', 'tr_type': tr_type, 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': SETTINGS.nxt_trade_tr, 'tr_key': code}}}))
+
     def stream(self, on_tick):
         while True:
             try:
-                appr_res = self.s.post(f'{self.rest}/oauth2/Approval', json={'grant_type': 'client_credentials', 'appkey': SETTINGS.kis_app_key, 'secretkey': SETTINGS.kis_app_secret}).json()
-                appr = appr_res.get('approval_key')
+                self.appr = self.s.post(f'{self.rest}/oauth2/Approval', json={'grant_type': 'client_credentials', 'appkey': SETTINGS.kis_app_key, 'secretkey': SETTINGS.kis_app_secret}).json().get('approval_key')
                 
                 def on_msg(ws, msg):
                     if isinstance(msg, bytes): msg = msg.decode('utf-8')
@@ -278,19 +244,13 @@ class KIS:
                 
                 def on_open(ws):
                     log.info("Websocket connected")
-                    def _subscribe():
-                        for c in STATE.candidates[:40]:
-                            try:
-                                if ws.sock and ws.sock.connected:
-                                    ws.send(json.dumps({'header': {'approval_key': appr, 'custtype': 'P', 'tr_type': '1', 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': SETTINGS.nxt_trade_tr, 'tr_key': c}}}))
-                                    time.sleep(0.25) 
-                                else:
-                                    break
-                            except: break
-                    threading.Thread(target=_subscribe, daemon=True).start()
+                    def _sub_all():
+                        for c in list(STATE.index_etfs.keys()) + list(STATE.vip_targets.keys()):
+                            self.subscribe(c); time.sleep(0.25)
+                    threading.Thread(target=_sub_all, daemon=True).start()
                     
-                ws = websocket.WebSocketApp(self.ws, on_open=on_open, on_message=on_msg)
-                ws.run_forever(ping_interval=25, ping_timeout=10)
+                self.ws = websocket.WebSocketApp(self.ws_url, on_open=on_open, on_message=on_msg)
+                self.ws.run_forever(ping_interval=25, ping_timeout=10)
             except Exception as e: 
                 log.error(f"WS 에러: {e}"); time.sleep(10)
 
@@ -311,39 +271,19 @@ class Brain:
         if max_5m_vol == 0 or recent_5m_vol > (max_5m_vol * 0.20): return None
         if latest.trade_strength < 105: return None
         return latest.close, vwap * 0.985, vwap
-
-    def get_closing_bets(self):
-        picks = []
-        for c in STATE.candidates[2:102]:
-            bars = list(STATE.bars.get(c, []))
-            if len(bars) < 300: continue
-            day_high = max(b.high for b in bars); day_low = min(b.low for b in bars); latest = bars[-1].close
-            if latest < day_low + (day_high - day_low) * 0.85: continue
-            vol_lunch = sum(b.volume for b in bars if 12 <= b.minute.hour < 14); vol_after = sum(b.volume for b in bars if b.minute.hour >= 14)
-            if vol_lunch > 0 and vol_after < (vol_lunch * 1.5): continue
-            try:
-                df = fdr.DataReader(c, start=now().date() - timedelta(days=40))
-                if len(df) < 20: continue
-                if df['Close'].rolling(5).mean().iloc[-1] <= df['Close'].rolling(20).mean().iloc[-1]: continue
-                picks.append((c, STATE.names.get(c, c), latest))
-            except: continue
-            if len(picks) >= 3: break
-        return picks
 BRAIN = Brain()
 
 class App:
     def __init__(self): self.sent = set(); self.today = ""
     
-    def sync_bars(self):
-        n = now()
-        for c in STATE.candidates[:40]:
-            raw = KIS_CLIENT.get_bars(c)
-            with STATE.lock:
-                q = STATE.bars.setdefault(c, deque(maxlen=390))
-                for r in reversed(raw):
-                    m = n.replace(hour=int(r['stck_cntg_hour'][:2]), minute=int(r['stck_cntg_hour'][2:4]), second=0, microsecond=0)
-                    q.append(Bar(m, num(r['stck_oprc']), num(r['stck_hgpr']), num(r['stck_lwpr']), num(r['stck_prpr']), int(r['cntg_vol']), 100))
-                    if c in STATE.index_etfs and STATE.index_opens[c] == 0: STATE.index_opens[c] = num(r['stck_oprc'])
+    def sync_bars_for(self, c):
+        raw = KIS_CLIENT.get_bars(c); n = now()
+        with STATE.lock:
+            q = STATE.bars.setdefault(c, deque(maxlen=390))
+            for r in reversed(raw):
+                m = n.replace(hour=int(r['stck_cntg_hour'][:2]), minute=int(r['stck_cntg_hour'][2:4]), second=0, microsecond=0)
+                q.append(Bar(m, num(r['stck_oprc']), num(r['stck_hgpr']), num(r['stck_lwpr']), num(r['stck_prpr']), int(r['cntg_vol']), 100))
+                if c in STATE.index_etfs and STATE.index_opens[c] == 0: STATE.index_opens[c] = num(r['stck_oprc'])
 
     def generate_chart_io(self, c, vwap):
         try:
@@ -362,42 +302,76 @@ class App:
         except: plt.close('all'); return None
 
     def update_dashboard(self):
-        cb_status = '발동됨🚨' if STATE.circuit_breaker else '정상🟢'
-        msg = f"📊 <b>[쾌걸스민 LIVE 전광판]</b> {now().strftime('%H:%M:%S')}\n"
-        msg += f"서킷브레이커: {cb_status} | 금일 포착: {len(self.sent)}건\n\n"
-        msg += "💼 <b>[방어 중인 종목]</b>\n"
+        msg = f"📊 <b>[VIP 전광판]</b> {now().strftime('%H:%M:%S')}\n⚙️ 한도: {STATE.vip_limit}개 (사용: {len(STATE.vip_targets)}개)\n\n"
+        
+        msg += "🎯 <b>[감시 대기 중인 타겟]</b>\n"
+        targets_only = {c: n for c, n in STATE.vip_targets.items() if c not in POSITIONS.data}
+        if not targets_only: msg += "  └ (없음)\n"
+        else:
+            for c, n in targets_only.items(): msg += f" • {n}\n"
+        
+        msg += "\n💼 <b>[집중 관리 중 (보유)]</b>\n"
         if not POSITIONS.data: msg += "  └ 관망 중\n"
         else:
             for c, pos in POSITIONS.data.items():
                 curr = STATE.bars[c][-1].close if STATE.bars.get(c) else pos.entry
                 gain = pct(curr, pos.entry)
-                msg += f"• <b>{pos.name}</b>: {curr:,.0f}원 ({gain:+.2f}%) | 🛡️ {pos.stop:,.0f}원\n"
-        if BOT.dashboard_msg_id is None:
-            BOT.dashboard_msg_id = BOT.send(msg)
-        else:
-            BOT.edit_message(SETTINGS.chat_id, BOT.dashboard_msg_id, msg)
+                msg += f" • <b>{pos.name}</b>: {curr:,.0f}원 ({gain:+.2f}%)\n    └ 🛡️ 방어선: {pos.stop:,.0f}원 (Lv.{pos.level})\n"
+        
+        if BOT.dashboard_msg_id is None: BOT.dashboard_msg_id = BOT.send(msg)
+        else: BOT.edit_message(SETTINGS.chat_id, BOT.dashboard_msg_id, msg)
 
     def parse_nlp_command(self, txt, chat_id):
         if not HAS_GEMINI or not SETTINGS.gemini_api_key: return False
         try:
             genai.configure(api_key=SETTINGS.gemini_api_key)
-            prompt = f"""
-            사용자가 봇에게 지시를 내렸어: "{txt}"
-            매수했으니 감시하라는 뜻인지 판단해 종목명과 가격을 추출해. JSON만 대답.
-            예시: "에코프로 10만원 방어해" -> {{"action": "buy", "stock": "에코프로", "price": 100000}}
-            """
+            prompt = f"""사용자의 지시: "{txt}"
+현재 감시 목록: {list(STATE.vip_targets.values())}
+다음 포맷의 JSON으로 반환해.
+action: "add"(타겟 추가), "remove"(타겟 삭제), "buy"(매수/방어 시작), "limit"(한도 변경), "unknown"
+stock: 사용자가 언급한 종목명 (add, remove, buy일 때)
+price: 매수가격 (buy일 때 숫자만, 모르면 0)
+limit: 숫자 (limit일 때만)
+"""
             model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
-            res = model.generate_content(prompt).text
-            data = json.loads(res)
-            if data.get('action') == 'buy':
+            data = json.loads(model.generate_content(prompt).text)
+            action = data.get('action')
+            
+            if action == 'add':
+                s_name = data.get('stock')
+                if len(STATE.vip_targets) >= STATE.vip_limit:
+                    BOT.send(f"⚠️ 감시 한도({STATE.vip_limit}개) 초과. 타겟을 먼저 삭제하거나 한도를 늘리세요.", chat_id); return True
+                code, exact = get_stock_code(s_name)
+                if code:
+                    STATE.vip_targets[code] = exact; DB.save_vip({"limit": STATE.vip_limit, "targets": STATE.vip_targets})
+                    KIS_CLIENT.subscribe(code); WORKER.submit(lambda: self.sync_bars_for(code))
+                    BOT.send(f"🎯 <b>[{exact}]</b> VIP 감시망에 추가 완료!\n0.1초 단위 밀착 감시를 시작합니다.", chat_id)
+                else: BOT.send(f"🤔 '{s_name}' 종목 코드를 찾지 못했습니다. 정확한 이름을 입력해주세요.", chat_id)
+                return True
+                
+            elif action == 'remove':
+                s_name = data.get('stock')
+                for c, n in list(STATE.vip_targets.items()):
+                    if s_name in n or s_name == n:
+                        del STATE.vip_targets[c]; DB.save_vip({"limit": STATE.vip_limit, "targets": STATE.vip_targets})
+                        KIS_CLIENT.subscribe(c, is_unsub=True)
+                        BOT.send(f"🗑️ <b>[{n}]</b> VIP 감시망에서 삭제했습니다.", chat_id); return True
+                return True
+                
+            elif action == 'limit':
+                lim = int(data.get('limit', 5))
+                STATE.vip_limit = lim; DB.save_vip({"limit": STATE.vip_limit, "targets": STATE.vip_targets})
+                BOT.send(f"⚙️ 최대 감시 한도를 <b>{lim}개</b>로 변경했습니다.", chat_id); return True
+                
+            elif action == 'buy':
                 s_name = data.get('stock'); price = float(data.get('price', 0))
-                for code, name in STATE.names.items():
-                    if s_name in name or s_name == name:
-                        pos = POSITIONS.register(code, name, price, 1)
-                        BOT.send(f"🤖 <b>[자연어 접수]</b> {name} 방어선({pos.stop:,.0f}원) 구축 완료!", chat_id)
-                        return True
+                for c, n in STATE.vip_targets.items():
+                    if s_name in n or s_name == n:
+                        p = POSITIONS.register(c, n, price, 1)
+                        BOT.send(f"🤖 <b>[집중관리 시작]</b> {n} 매수 확인!\n최초 방어선({p.stop:,.0f}원)을 설정하고 보호합니다.", chat_id); return True
+                return True
             return False
-        except: return False
+        except Exception as e: log.error(e); return False
 
     def on_tick(self, c, p, v, ts, m):
         with STATE.lock:
@@ -409,77 +383,47 @@ class App:
         if c in STATE.index_etfs and STATE.index_opens[c] > 0:
             drop_pct = pct(p, STATE.index_opens[c])
             if drop_pct <= SETTINGS.circuit_breaker_pct and not STATE.circuit_breaker:
-                STATE.circuit_breaker = True; BOT.send(f"🚨 <b>[서킷 브레이커 발동]</b> {STATE.index_etfs[c]} 폭락. 단타 중지.")
+                STATE.circuit_breaker = True; BOT.send(f"🚨 <b>[서킷 브레이커 발동]</b> 시장 폭락 감지. 감시 중지.")
         
         msg = POSITIONS.check_trailing(c, p)
         if msg: BOT.send(msg)
 
-        # ==============================================================
-        # [BEAST MODE 패치] 기존 정규장(09~14:30) 락 해제! 
-        # 아침 8시부터 저녁 8시까지 12시간 내내 NXT 사냥을 시작합니다.
-        # ==============================================================
-        if 8 <= m.hour < 20:
+        if 8 <= m.hour < 20 and c in STATE.vip_targets:
             if not STATE.circuit_breaker and c not in POSITIONS.data and c not in self.sent:
                 res = BRAIN.check_sniper(c)
                 if res:
                     price, vwap_stop, vwap_val = res
                     self.sent.add(c)
-                    name = STATE.names.get(c, c)
+                    name = STATE.vip_targets.get(c, c)
                     
                     deep_link = f"https://m.stock.naver.com/domestic/stock/{c}/total"
                     inline_kb = {"inline_keyboard": [
                         [{"text": f"📈 네이버/MTS 차트 바로가기", "url": deep_link}],
-                        [{"text": f"💰 현재가({price:,.0f}원) 방어선 구축", "callback_data": f"buy_{c}_{price}"}],
-                        [{"text": "🗑️ 차트 구림 (관망)", "callback_data": f"pass_{c}"}]
+                        [{"text": f"💰 현재가({price:,.0f}원) 집중 관리(방어) 시작", "callback_data": f"buy_{c}_{price}"}],
+                        [{"text": "🗑️ 이번 타점 무시 (패스)", "callback_data": f"pass_{c}"}]
                     ]}
                     
-                    caption = f"🔫 <b>[쾌걸스민 야간포착] {name}</b> ({c})\n\n💰 <b>VWAP 맥점:</b> {price:,.0f}원\n🛡️ <b>동적 손절선:</b> {vwap_stop:,.0f}원\n\n⚠️ <i>NXT 호가창이 얇을 수 있으니 반드시 호가 확인!</i>\n👇 <i>차트 확인 후 버튼을 누르세요</i>"
-                    
+                    caption = f"🔫 <b>[VIP 타점 포착] {name}</b>\n\nVIP 종목에 V자 수급 반등이 감지되었습니다.\n💰 <b>VWAP 맥점:</b> {price:,.0f}원\n🛡️ <b>예상 손절선:</b> {vwap_stop:,.0f}원\n\n👇 <i>매수 후 버튼을 누르면 즉시 집중관리가 시작됩니다.</i>"
                     chart_io = self.generate_chart_io(c, vwap_val)
                     if chart_io: BOT.send_photo(chart_io, caption, reply_markup=inline_kb)
                     else: BOT.send(caption, reply_markup=inline_kb) 
 
-    def run_night_ai(self):
-        top_txt = ", ".join([n for _, n in STATE.top_20_list]) or "데이터 없음"
-        if not HAS_GEMINI or not SETTINGS.gemini_api_key:
-            DB.save_ai(top_txt); BOT.send(f"🌙 <b>[야간 브리핑]</b>\n오늘 주도주: {top_txt}\n(AI 생략)"); return
+    def run_vip_news(self):
+        vip_names = ", ".join(STATE.vip_targets.values())
+        if not vip_names: BOT.send("분석할 VIP 종목이 없습니다."); return
+        BOT.send(f"📰 <b>[{vip_names}]</b>\n최신 호재와 모멘텀을 AI가 심층 분석 중입니다. 잠시만 기다려주세요...")
         try:
             genai.configure(api_key=SETTINGS.gemini_api_key)
-            res = genai.GenerativeModel('gemini-2.5-flash').generate_content(f"오늘 주도주: {top_txt}\n내일 튈 대장주 3개 분석해.")
-            DB.save_ai(res.text); BOT.send(f"🌙 <b>[야간 AI 브리핑]</b>\n\n{res.text}")
-        except Exception as e: DB.save_ai(top_txt); BOT.send(f"🌙 <b>[야간 오류]</b>\n원시 데이터: {top_txt}")
-
-    def run_morning_ai(self):
-        try: us = "\n".join([f"{n}: {(yf.Ticker(s).history(period='2d')['Close'].iloc[-1] / yf.Ticker(s).history(period='2d')['Close'].iloc[-2] - 1)*100:+.2f}%" for n, s in {'S&P500':'^GSPC', 'Nasdaq':'^IXIC'}.items()])
-        except: us = "미증시 로드 실패"
-        saved = DB.load_ai()
-        if not HAS_GEMINI or not SETTINGS.gemini_api_key:
-            BOT.send(f"☀️ <b>[아침 브리핑]</b>\n미증시:\n{us}\n\n어제 픽:\n{saved}"); return
-        try:
-            genai.configure(api_key=SETTINGS.gemini_api_key)
-            res = genai.GenerativeModel('gemini-2.5-flash').generate_content(f"미증시: {us}\n어제픽: {saved}\n오늘 아침 단타 관심주 3개 압축해.")
-            BOT.send(f"☀️ <b>[아침 AI 브리핑]</b>\n\n{res.text}")
-        except: BOT.send(f"☀️ <b>[아침 오류]</b>\n미증시: {us}\n어제픽: {saved}")
+            res = genai.GenerativeModel('gemini-2.5-flash').generate_content(f"오늘 한국 증시에서 다음 종목들에 대한 최신 뉴스, 수주 공시, 호재를 심도있게 분석해줘: {vip_names}")
+            BOT.send(f"📰 <b>[VIP 전담 브리핑]</b>\n\n{res.text}")
+        except: BOT.send("AI 뉴스 검색 중 오류가 발생했습니다.")
 
     def scheduler(self):
-        done = {}
         last_dash_update = 0
         while True:
             n = now(); d = str(n.date())
             if self.today != d: self.today = d; self.sent.clear(); STATE.circuit_breaker = False
-            
-            if time.time() - last_dash_update > 10:
-                WORKER.submit(self.update_dashboard)
-                last_dash_update = time.time()
-
-            if n.weekday() < 5:
-                if n.hour == 7 and done.get('m_ai') != d: WORKER.submit(self.run_morning_ai); done['m_ai'] = d
-                if n.hour == 9 and done.get('sync') != d: WORKER.submit(self.sync_bars); done['sync'] = d
-                if n.hour == 15 and n.minute >= 15 and done.get('close') != d:
-                    picks = BRAIN.get_closing_bets()
-                    txt = "\n".join([f"• {n} ({c}): {p:,.0f}원" for c, n, p in picks]) or "조건 만족 없음"
-                    BOT.send(f"🌇 <b>[쾌걸스민 종배 3선]</b>\n\n{txt}"); done['close'] = d
-                if n.hour == 22 and done.get('n_ai') != d: WORKER.submit(self.run_night_ai); done['n_ai'] = d
+            if time.time() - last_dash_update > 10: WORKER.submit(self.update_dashboard); last_dash_update = time.time()
             time.sleep(2) 
 
     def handle_callback(self, cb):
@@ -487,78 +431,64 @@ class App:
         chat_id = msg.get('chat', {}).get('id'); msg_id = msg.get('message_id')
         
         if data.startswith('buy_'):
-            _, c, p_str = data.split('_'); price = float(p_str); name = STATE.names.get(c, c)
+            _, c, p_str = data.split('_'); price = float(p_str); name = STATE.vip_targets.get(c, c)
             POSITIONS.register(c, name, price, 1) 
-            BOT.answer_callback(cb_id, text=f"✅ {name} 방어선 구축 완료!")
+            BOT.answer_callback(cb_id, text=f"✅ {name} 집중 관리 시작!")
             orig_text = msg.get('caption', '') or msg.get('text', '')
-            new_text = orig_text.replace("👇 차트 확인 후 버튼을 누르세요", f"✅ <b>[방어선 가동 중]</b> 기준가: {price:,.0f}원")
+            new_text = orig_text.replace("👇 매수 후 버튼을 누르면 즉시 집중관리가 시작됩니다.", f"✅ <b>[집중 관리 가동 중]</b> 기준가: {price:,.0f}원")
             try: BOT.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/editMessageCaption', json={'chat_id': str(chat_id), 'message_id': msg_id, 'caption': new_text, 'parse_mode': 'HTML'})
             except: pass
             
         elif data.startswith('pass_'):
             BOT.answer_callback(cb_id, text="🗑️ 관망합니다.")
             orig_text = msg.get('caption', '') or msg.get('text', '')
-            new_text = orig_text.replace("👇 차트 확인 후 버튼을 누르세요", "🗑️ <b>[스팸 락 / 관망 패스]</b>")
+            new_text = orig_text.replace("👇 매수 후 버튼을 누르면 즉시 집중관리가 시작됩니다.", "🗑️ <b>[패스 처리됨]</b>")
             try: BOT.s.post(f'https://api.telegram.org/bot{SETTINGS.telegram_token}/editMessageCaption', json={'chat_id': str(chat_id), 'message_id': msg_id, 'caption': new_text, 'parse_mode': 'HTML'})
             except: pass
 
     def handle_text(self, txt, chat):
-        if txt == "☀️ 아침 브리핑 호출": WORKER.submit(self.run_morning_ai); return
-        elif txt == "🌙 야간 브리핑 호출": WORKER.submit(self.run_night_ai); return
+        if txt == "📊 타겟 현황 / 대시보드": WORKER.submit(self.update_dashboard); return
+        elif txt == "📰 VIP 타겟 뉴스/공시": WORKER.submit(self.run_vip_news); return
         elif txt == "🛑 모든 방어선 해제":
-            POSITIONS.data.clear(); POSITIONS.save(); BOT.send("🛑 모든 감시와 방어선이 해제되었습니다.", chat); return
-        
-        p = txt.split(); cmd = p[0]
-        if cmd == '/상태': pass 
-        elif cmd == '/매도' and len(p) >= 2:
-            c = "".join(p[1:])
-            for code, name in STATE.names.items():
-                if c in name or c == code:
-                    if POSITIONS.remove(code): BOT.send(f"✅ {name} 감시 종료.", chat)
-                    return
-        elif cmd in ['/도움말', '/help', '도움말', '?']:
+            POSITIONS.data.clear(); POSITIONS.save(); BOT.send("🛑 모든 종목의 방어선과 집중관리를 해제했습니다.", chat); return
+        elif txt in ["📖 매뉴얼 보기", "/도움말", "/help", "도움말", "?"]:
             help_text = """
-🤖 <b>[쾌걸스민 V3.1.5 야수 모드 매뉴얼]</b>
+🤖 <b>[쾌걸스민 V4 VIP 집중 관리 모드]</b>
 
-<b>🚨 [경고] 08:00~20:00 풀타임 감시가 활성화되었습니다. 
-정규장 외 시간의 타점은 호가창을 반드시 확인하십시오.</b>
+사용자님만의 '소수 정예 주력 종목'을 집중 감시합니다.
 
-<b>1. 🕹️ 하단 전용 리모컨</b>
-입력창 밑의 버튼을 누르시면 됩니다.
-• [아침/야간 브리핑]: AI 시황 즉시 호출
-• [모든 방어선 해제]: 감시 중인 전 종목 락 해제
+<b>1. 🎯 감시 타겟 추가/삭제 (그냥 말하세요!)</b>
+• "지엔씨에너지 감시 추가해"
+• "테크윙 감시 빼줘"
+• "최대 감시 한도 10개로 변경해"
 
-<b>2. 🗣️ 자연어 매매 지시 (카톡하듯 대화)</b>
-명령어 없이 편하게 치세요! (Gemini AI 파싱)
-<i>예) "스민아 에코프로 10만원에 샀어 방어해"</i>
+<b>2. 💼 매수 후 3단계 집중 관리</b>
+타점 포착 후 버튼을 누르거나, <b>"지엔씨 15000원 매수했어 방어해"</b>라고 치면 즉시 가동!
+• <b>[1단계]</b> 기본 손절 방어 (-2%)
+• <b>[2단계]</b> 수익 3% 돌파 시 -> 원금 절대방어 락
+• <b>[3단계]</b> 수익 6% 돌파 시 -> 고점 트레일링 스탑
 
-<b>3. 🎯 타점 포착 시 (1-Click 감시)</b>
-스나이퍼 시그널이 오면 메시지 하단의
-<b>[💰 현재가 방어선 구축]</b> 버튼을 터치하세요!
-봇이 즉각 트레일링 스탑 감시를 시작합니다.
-
-<b>4. ⌨️ 수동 명령어 (예비용)</b>
-• <code>/매도 [종목명]</code> : 특정 종목만 감시 종료
-• <code>/도움말</code> : 이 매뉴얼 다시 보기
+<b>3. 🕹️ 하단 리모컨 100% 활용</b>
+• <b>[VIP 타겟 뉴스]</b>: 내 주력 종목 호재만 딥 다이브!
 """
-            BOT.send(help_text.strip(), chat)
+            BOT.send(help_text.strip(), chat); return
 
-        elif not cmd.startswith('/'):
+        if not txt.startswith('/'):
             if not self.parse_nlp_command(txt, chat):
-                BOT.send("🤔 명령을 이해하지 못했습니다.\n(매뉴얼을 보려면 '/도움말'을 입력하세요.)", chat)
+                BOT.send("🤔 명령을 이해하지 못했습니다. 종목 추가/삭제/매수는 자연스럽게 말씀해주세요!\n(매뉴얼 보기: 하단 버튼)", chat)
 
     def start(self):
         WORKER.start(); POSITIONS.load(); BOT.text_handler = self.handle_text; BOT.callback_handler = self.handle_callback
+        for c in STATE.index_etfs.keys(): WORKER.submit(lambda code=c: self.sync_bars_for(code))
+        for c in STATE.vip_targets.keys(): WORKER.submit(lambda code=c: self.sync_bars_for(code))
         threading.Thread(target=BOT.poll, daemon=True).start()
         threading.Thread(target=self.scheduler, daemon=True).start()
-        STATE.load_candidates()
-        if in_session("08:00", "15:30"): self.sync_bars()
         threading.Thread(target=KIS_CLIENT.stream, args=(self.on_tick,), daemon=True).start()
-        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n🔥 야수 모드 발동: 08시~20시 전구간 NXT 사냥 시작!")
+        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\nVIP 전담 감시망이 가동되었습니다. 하단 버튼으로 매뉴얼을 확인하세요!")
 
 APP = App(); web = Flask(__name__)
 @web.get('/')
-def root(): return 'Kkwaegeol Seumin V3.1.5 Beast Mode Running', 200
+def root(): return 'Kkwaegeol Seumin V4 VIP Sniper Running', 200
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: (time.sleep(2), APP.start()), daemon=True).start()
