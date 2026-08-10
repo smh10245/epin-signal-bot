@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 쾌걸스민 V3.1.3 (The Absolute Zenith)
-# 1. 텔레그램 실시간 전광판 (10초 주기 Live Dashboard)
-# 2. 자연어 매매 지시 파싱 (Gemini JSON 구조화)
-# 3. MTS 호가창 다이렉트 딥링크 버튼 추가
-# 4. 차트 즉석 렌더링 + 찌라시 판독 + 서킷브레이커
-# 5. KIS 웹소켓 DDoS 방지 패치 (0.25초)
-# 6. [패치] KRX 종목 로드 IP 차단 우회 및 5회 재시도(Retry) 로직
+# 🤖 쾌걸스민 V3.1.5 (The Absolute Zenith - BEAST MODE)
+# 1. [BEAST MODE] NXT 12시간(08:00~20:00) 풀타임 스나이퍼 개방
+# 2. 텔레그램 실시간 전광판 (10초 주기 Live Dashboard)
+# 3. 자연어 매매 지시 파싱 (Gemini JSON 구조화)
+# 4. 네이버 금융 백도어 우회 (KRX 차단 완벽 해결)
+# 5. KIS 웹소켓 DDoS 방어 우회 패치 (0.25초)
 # ==========================================
 
 import os, json, time, threading, queue, logging, io
@@ -34,7 +33,7 @@ except ImportError:
 
 KST = ZoneInfo('Asia/Seoul')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger('seumin.v313')
+log = logging.getLogger('seumin.beast')
 
 # ===== 1. 유틸리티 함수 =====
 def now(): return datetime.now(KST)
@@ -53,7 +52,7 @@ def in_session(sh, eh):
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '3.1.3 (KRX Bypass Patch)'
+    version: str = '3.1.5 (Beast Mode)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -170,16 +169,34 @@ class SeuminState:
         self.lock = threading.RLock(); self.names = {}; self.meta = {}; self.candidates = []; self.bars = {}; self.top_20_list = []; self.circuit_breaker = False
         self.index_etfs = {'069500': 'KOSPI', '226490': 'KOSDAQ'}; self.index_opens = {'069500': 0, '226490': 0}
 
-    # [핵심 패치] KRX 디도스 차단 우회 및 5회 재시도 루프 적용
     def load_candidates(self):
+        try:
+            log.info("KRX 방화벽 우회: 네이버 API(거래대금 상위) 로드 시도...")
+            temp_list = []
+            for market in ['KOSPI', 'KOSDAQ']:
+                url = f"https://m.stock.naver.com/api/stocks/topAmount/{market}?page=1&pageSize=100"
+                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 Windows NT 10.0'}, timeout=10).json()
+                for s in res.get('stocks', []):
+                    c = s.get('itemCode'); n = s.get('stockName')
+                    amt = num(s.get('accumulatedTradingValue', '0'))
+                    if c and c.isdigit():
+                        self.names[c] = n
+                        temp_list.append((c, amt))
+            
+            if temp_list:
+                temp_list.sort(key=lambda x: x[1], reverse=True) 
+                with self.lock:
+                    self.top_20_list = [(c, self.names[c]) for c, _ in temp_list[:20]]
+                    self.candidates = list(self.index_etfs.keys()) + [c for c, _ in temp_list if c not in self.index_etfs][:198]
+                log.info(f"✅ 네이버 백도어 로드 완벽 성공! (감시 대상 주도주: {len(self.candidates)}개)")
+                return
+        except Exception as e:
+            log.warning(f"네이버 우회 로드 실패: {e}")
+
         for attempt in range(5):
             try:
-                log.info(f"KRX 종목 데이터 로드 시도 ({attempt+1}/5)...")
-                df_kospi = fdr.StockListing('KOSPI')
-                time.sleep(2) # KRX 디도스 방어 회피를 위한 2초 딜레이
-                df_kosdaq = fdr.StockListing('KOSDAQ')
-                df = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
-                
+                log.info(f"KRX 공식 데이터 로드 재시도 ({attempt+1}/5)...")
+                df = pd.concat([fdr.StockListing('KOSPI'), fdr.StockListing('KOSDAQ')], ignore_index=True)
                 with self.lock:
                     valid = []
                     for _, r in df.iterrows():
@@ -197,12 +214,10 @@ class SeuminState:
                     self.top_20_list = [(c, self.names[c]) for _, c, _, _ in scores[:20]]
                     self.candidates = list(self.index_etfs.keys()) + [c for _, c, _, _ in scores[:198]]
                 log.info(f"✅ KRX 로드 성공! 감시 대상 주도주: {len(self.candidates)}개")
-                return # 성공 시 루프 종료
+                return 
             except Exception as e:
-                log.warning(f"KRX 로드 실패 (시도 {attempt+1}): {e}")
-                time.sleep(5) # 실패 시 5초 대기 후 재시도
-        
-        log.error("❌ KRX 데이터 로드 최종 실패. Render IP가 차단되었을 수 있습니다.")
+                log.warning(f"KRX 로드 실패: {e}"); time.sleep(3)
+        log.error("❌ 주도주 로드 최종 실패. 봇이 정상적으로 작동하지 않을 수 있습니다.")
 
 STATE = SeuminState()
 
@@ -399,7 +414,11 @@ class App:
         msg = POSITIONS.check_trailing(c, p)
         if msg: BOT.send(msg)
 
-        if 9 <= m.hour < 14 or (m.hour == 14 and m.minute < 30):
+        # ==============================================================
+        # [BEAST MODE 패치] 기존 정규장(09~14:30) 락 해제! 
+        # 아침 8시부터 저녁 8시까지 12시간 내내 NXT 사냥을 시작합니다.
+        # ==============================================================
+        if 8 <= m.hour < 20:
             if not STATE.circuit_breaker and c not in POSITIONS.data and c not in self.sent:
                 res = BRAIN.check_sniper(c)
                 if res:
@@ -414,7 +433,7 @@ class App:
                         [{"text": "🗑️ 차트 구림 (관망)", "callback_data": f"pass_{c}"}]
                     ]}
                     
-                    caption = f"🔫 <b>[쾌걸스민 즉석 포착] {name}</b> ({c})\n\n💰 <b>VWAP 맥점:</b> {price:,.0f}원\n🛡️ <b>동적 손절선:</b> {vwap_stop:,.0f}원\n\n👇 <i>차트 확인 후 버튼을 누르세요</i>"
+                    caption = f"🔫 <b>[쾌걸스민 야간포착] {name}</b> ({c})\n\n💰 <b>VWAP 맥점:</b> {price:,.0f}원\n🛡️ <b>동적 손절선:</b> {vwap_stop:,.0f}원\n\n⚠️ <i>NXT 호가창이 얇을 수 있으니 반드시 호가 확인!</i>\n👇 <i>차트 확인 후 버튼을 누르세요</i>"
                     
                     chart_io = self.generate_chart_io(c, vwap_val)
                     if chart_io: BOT.send_photo(chart_io, caption, reply_markup=inline_kb)
@@ -499,7 +518,10 @@ class App:
                     return
         elif cmd in ['/도움말', '/help', '도움말', '?']:
             help_text = """
-🤖 <b>[쾌걸스민 V3.1.3 사용 매뉴얼]</b>
+🤖 <b>[쾌걸스민 V3.1.5 야수 모드 매뉴얼]</b>
+
+<b>🚨 [경고] 08:00~20:00 풀타임 감시가 활성화되었습니다. 
+정규장 외 시간의 타점은 호가창을 반드시 확인하십시오.</b>
 
 <b>1. 🕹️ 하단 전용 리모컨</b>
 입력창 밑의 버튼을 누르시면 됩니다.
@@ -532,11 +554,11 @@ class App:
         STATE.load_candidates()
         if in_session("08:00", "15:30"): self.sync_bars()
         threading.Thread(target=KIS_CLIENT.stream, args=(self.on_tick,), daemon=True).start()
-        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n채팅창 상단에 실시간 전광판이 켜집니다. (매뉴얼: /도움말)")
+        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n🔥 야수 모드 발동: 08시~20시 전구간 NXT 사냥 시작!")
 
 APP = App(); web = Flask(__name__)
 @web.get('/')
-def root(): return 'Kkwaegeol Seumin V3.1.3 Zenith Final', 200
+def root(): return 'Kkwaegeol Seumin V3.1.5 Beast Mode Running', 200
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: (time.sleep(2), APP.start()), daemon=True).start()
