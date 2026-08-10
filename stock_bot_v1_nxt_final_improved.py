@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 # ==========================================
-# 🤖 쾌걸스민 V3.1.2 (The Absolute Zenith / 통합 완성본)
+# 🤖 쾌걸스민 V3.1.3 (The Absolute Zenith)
 # 1. 텔레그램 실시간 전광판 (10초 주기 Live Dashboard)
 # 2. 자연어 매매 지시 파싱 (Gemini JSON 구조화)
 # 3. MTS 호가창 다이렉트 딥링크 버튼 추가
 # 4. 차트 즉석 렌더링 + 찌라시 판독 + 서킷브레이커
-# 5. [안정화] in_session 함수 및 KIS 웹소켓 DDoS 방지 패치
-# 6. [UX] /도움말 매뉴얼 기능 완벽 통합
+# 5. KIS 웹소켓 DDoS 방지 패치 (0.25초)
+# 6. [패치] KRX 종목 로드 IP 차단 우회 및 5회 재시도(Retry) 로직
 # ==========================================
 
 import os, json, time, threading, queue, logging, io
@@ -34,7 +34,7 @@ except ImportError:
 
 KST = ZoneInfo('Asia/Seoul')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger('seumin.v312')
+log = logging.getLogger('seumin.v313')
 
 # ===== 1. 유틸리티 함수 =====
 def now(): return datetime.now(KST)
@@ -53,7 +53,7 @@ def in_session(sh, eh):
 
 @dataclass(frozen=True)
 class Settings:
-    version: str = '3.1.2 (The Zenith Final)'
+    version: str = '3.1.3 (KRX Bypass Patch)'
     telegram_token: str = os.getenv('TELEGRAM_TOKEN', '').strip()
     chat_id: str = (os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID') or '').strip()
     gemini_api_key: str = os.getenv('GEMINI_API_KEY', '').strip()
@@ -170,26 +170,40 @@ class SeuminState:
         self.lock = threading.RLock(); self.names = {}; self.meta = {}; self.candidates = []; self.bars = {}; self.top_20_list = []; self.circuit_breaker = False
         self.index_etfs = {'069500': 'KOSPI', '226490': 'KOSDAQ'}; self.index_opens = {'069500': 0, '226490': 0}
 
+    # [핵심 패치] KRX 디도스 차단 우회 및 5회 재시도 루프 적용
     def load_candidates(self):
-        try:
-            df = pd.concat([fdr.StockListing('KOSPI'), fdr.StockListing('KOSDAQ')], ignore_index=True)
-            with self.lock:
-                valid = []
-                for _, r in df.iterrows():
-                    c = str(r.get('Code') or r.get('Symbol')).zfill(6); n = str(r.get('Name') or c)
-                    if c in ['000000', 'nan']: continue
-                    self.names[c] = n; self.meta[c] = r
-                    cap = num(r.get('Marcap')); vol = num(r.get('Volume'))
-                    if cap < SETTINGS.min_market_cap or vol < SETTINGS.min_daily_volume: continue
-                    amt = num(r.get('Amount')) or (num(r.get('Close')) * vol)
-                    valid.append((c, amt, amt / cap if cap else 0))
-                valid.sort(key=lambda x: x[1], reverse=True); amt_r = {x[0]: i for i, x in enumerate(valid)}
-                valid.sort(key=lambda x: x[2], reverse=True); turn_r = {x[0]: i for i, x in enumerate(valid)}
-                scores = [(amt_r[c]*0.5 + turn_r[c]*0.5, c, amt, turn) for c, amt, turn in valid]
-                scores.sort()
-                self.top_20_list = [(c, self.names[c]) for _, c, _, _ in scores[:20]]
-                self.candidates = list(self.index_etfs.keys()) + [c for _, c, _, _ in scores[:198]]
-        except Exception as e: log.error(f"FDR 로드 실패: {e}")
+        for attempt in range(5):
+            try:
+                log.info(f"KRX 종목 데이터 로드 시도 ({attempt+1}/5)...")
+                df_kospi = fdr.StockListing('KOSPI')
+                time.sleep(2) # KRX 디도스 방어 회피를 위한 2초 딜레이
+                df_kosdaq = fdr.StockListing('KOSDAQ')
+                df = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+                
+                with self.lock:
+                    valid = []
+                    for _, r in df.iterrows():
+                        c = str(r.get('Code') or r.get('Symbol')).zfill(6); n = str(r.get('Name') or c)
+                        if c in ['000000', 'nan']: continue
+                        self.names[c] = n; self.meta[c] = r
+                        cap = num(r.get('Marcap')); vol = num(r.get('Volume'))
+                        if cap < SETTINGS.min_market_cap or vol < SETTINGS.min_daily_volume: continue
+                        amt = num(r.get('Amount')) or (num(r.get('Close')) * vol)
+                        valid.append((c, amt, amt / cap if cap else 0))
+                    valid.sort(key=lambda x: x[1], reverse=True); amt_r = {x[0]: i for i, x in enumerate(valid)}
+                    valid.sort(key=lambda x: x[2], reverse=True); turn_r = {x[0]: i for i, x in enumerate(valid)}
+                    scores = [(amt_r[c]*0.5 + turn_r[c]*0.5, c, amt, turn) for c, amt, turn in valid]
+                    scores.sort()
+                    self.top_20_list = [(c, self.names[c]) for _, c, _, _ in scores[:20]]
+                    self.candidates = list(self.index_etfs.keys()) + [c for _, c, _, _ in scores[:198]]
+                log.info(f"✅ KRX 로드 성공! 감시 대상 주도주: {len(self.candidates)}개")
+                return # 성공 시 루프 종료
+            except Exception as e:
+                log.warning(f"KRX 로드 실패 (시도 {attempt+1}): {e}")
+                time.sleep(5) # 실패 시 5초 대기 후 재시도
+        
+        log.error("❌ KRX 데이터 로드 최종 실패. Render IP가 차단되었을 수 있습니다.")
+
 STATE = SeuminState()
 
 class PositionEngine:
@@ -256,11 +270,8 @@ class KIS:
                                     ws.send(json.dumps({'header': {'approval_key': appr, 'custtype': 'P', 'tr_type': '1', 'content-type': 'utf-8'}, 'body': {'input': {'tr_id': SETTINGS.nxt_trade_tr, 'tr_key': c}}}))
                                     time.sleep(0.25) 
                                 else:
-                                    log.warning("서버에 의해 웹소켓이 끊어져 구독 루프를 중단합니다.")
                                     break
-                            except Exception as e:
-                                log.warning(f"구독 요청 중단: {e}")
-                                break
+                            except: break
                     threading.Thread(target=_subscribe, daemon=True).start()
                     
                 ws = websocket.WebSocketApp(self.ws, on_open=on_open, on_message=on_msg)
@@ -473,14 +484,12 @@ class App:
             except: pass
 
     def handle_text(self, txt, chat):
-        # 1. 리모컨 매핑
         if txt == "☀️ 아침 브리핑 호출": WORKER.submit(self.run_morning_ai); return
         elif txt == "🌙 야간 브리핑 호출": WORKER.submit(self.run_night_ai); return
         elif txt == "🛑 모든 방어선 해제":
             POSITIONS.data.clear(); POSITIONS.save(); BOT.send("🛑 모든 감시와 방어선이 해제되었습니다.", chat); return
         
         p = txt.split(); cmd = p[0]
-        # 2. 수동 명령어
         if cmd == '/상태': pass 
         elif cmd == '/매도' and len(p) >= 2:
             c = "".join(p[1:])
@@ -490,7 +499,7 @@ class App:
                     return
         elif cmd in ['/도움말', '/help', '도움말', '?']:
             help_text = """
-🤖 <b>[쾌걸스민 V3.1.2 사용 매뉴얼]</b>
+🤖 <b>[쾌걸스민 V3.1.3 사용 매뉴얼]</b>
 
 <b>1. 🕹️ 하단 전용 리모컨</b>
 입력창 밑의 버튼을 누르시면 됩니다.
@@ -512,7 +521,6 @@ class App:
 """
             BOT.send(help_text.strip(), chat)
 
-        # 3. 자연어 매매 지시 AI 파싱
         elif not cmd.startswith('/'):
             if not self.parse_nlp_command(txt, chat):
                 BOT.send("🤔 명령을 이해하지 못했습니다.\n(매뉴얼을 보려면 '/도움말'을 입력하세요.)", chat)
@@ -524,11 +532,11 @@ class App:
         STATE.load_candidates()
         if in_session("08:00", "15:30"): self.sync_bars()
         threading.Thread(target=KIS_CLIENT.stream, args=(self.on_tick,), daemon=True).start()
-        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n이제 채팅창 상단에 실시간 전광판이 켜집니다. (매뉴얼: /도움말)")
+        BOT.send(f"🚀 <b>쾌걸스민 V{SETTINGS.version} 기동 완료!</b>\n채팅창 상단에 실시간 전광판이 켜집니다. (매뉴얼: /도움말)")
 
 APP = App(); web = Flask(__name__)
 @web.get('/')
-def root(): return 'Kkwaegeol Seumin V3.1.2 Zenith Final', 200
+def root(): return 'Kkwaegeol Seumin V3.1.3 Zenith Final', 200
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: (time.sleep(2), APP.start()), daemon=True).start()
