@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>명하 VIP LIVE</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg:#07111f;--card:#0e1b2f;--card2:#12233a;--line:#213853;
+  --text:#edf6ff;--muted:#8ea6be;--blue:#2f7cff;--cyan:#47dad7;
+  --green:#2bd27f;--yellow:#ffd65a;--orange:#ff9d42;--red:#ff6272;
+}
+*{box-sizing:border-box} html,body{margin:0;min-height:100%;background:linear-gradient(180deg,#07101c,#0a1525 55%,#07101c);color:var(--text);
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR",sans-serif}
+button{font:inherit}.app{max-width:820px;margin:auto;padding:14px 13px 84px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.brand{font-size:22px;font-weight:900;letter-spacing:-.4px}.sub{font-size:11px;color:var(--muted);margin-top:3px}
+.live{padding:7px 10px;border:1px solid var(--line);border-radius:999px;background:#0d1c31;font-size:11px}
+.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.kpi{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:11px}
+.kpi small{display:block;color:var(--muted);font-size:10px}.kpi strong{display:block;margin-top:4px;font-size:15px}
+.tabs{display:flex;gap:7px;overflow-x:auto;padding:12px 0 5px}.tab{border:0;border-radius:999px;padding:9px 13px;white-space:nowrap;background:#10223a;color:#a8bdd2}
+.tab.on{background:var(--blue);color:#fff;font-weight:800}
+.card{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:18px;padding:14px;margin-top:10px;box-shadow:0 8px 30px rgba(0,0,0,.12)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px}.name{font-weight:850;font-size:16px}.code{font-size:10px;color:var(--muted);margin-left:5px}
+.price{font-size:20px;font-weight:900;margin-top:8px}.status{font-size:11px;font-weight:850;padding:5px 8px;border-radius:999px;background:#0b1728;border:1px solid #213957}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:11px}.metric{background:#0a1727;border:1px solid #182f4a;border-radius:11px;padding:8px;text-align:center}
+.metric small{display:block;color:var(--muted);font-size:9px;margin-bottom:3px}.metric b{font-size:12px}
+.scorebar{height:7px;background:#071321;border-radius:99px;overflow:hidden;margin-top:11px}.scorebar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#377cff,#36d5b2)}
+.note{font-size:11px;color:#bfd0df;margin-top:9px;line-height:1.45}.empty{text-align:center;color:var(--muted);padding:38px 0}
+.section-title{font-size:13px;font-weight:850;margin:16px 2px 7px}.signal{font-size:12px;padding:10px 11px;background:#0b1828;border:1px solid #1b3450;border-radius:12px;margin:7px 0}
+.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}.orange{color:var(--orange)}
+.bottom{position:fixed;left:0;right:0;bottom:0;background:rgba(6,15,27,.94);backdrop-filter:blur(14px);border-top:1px solid var(--line);padding:9px 12px calc(9px + env(safe-area-inset-bottom))}
+.bottomin{max-width:820px;margin:auto;display:grid;grid-template-columns:1fr 1fr;gap:8px}.btn{border:0;border-radius:13px;padding:11px;color:#fff;background:#142944;font-weight:800}.btn.primary{background:var(--blue)}
+.modal{position:fixed;inset:0;background:rgba(2,7,13,.78);z-index:30;display:none;align-items:flex-end}.modal.on{display:flex}.sheet{width:100%;max-width:820px;margin:auto;background:#091728;border:1px solid #203954;border-radius:22px 22px 0 0;padding:16px 14px calc(18px + env(safe-area-inset-bottom));max-height:92vh;overflow:auto}
+.sheet h2{font-size:19px;margin:0}.sheet .close{border:0;background:#172b43;color:#fff;border-radius:10px;padding:7px 10px}
+.detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin:12px 0}.detailbox{background:#0d1c30;border:1px solid #1b3551;border-radius:12px;padding:9px;text-align:center}.detailbox small{display:block;color:var(--muted);font-size:9px}.detailbox b{font-size:13px}
+.chartwrap{height:260px;background:#081421;border-radius:14px;padding:8px;border:1px solid #19314b}
+
+.actions{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:12px}
+.action{border:1px solid #24405e;border-radius:12px;padding:10px;background:#10233a;color:#fff;font-weight:800}
+.action.goodbtn{background:#123527;border-color:#246b4a}.action.warnbtn{background:#3b3111;border-color:#766522}
+.action.badbtn{background:#3a1820;border-color:#71303d}.action.bluebtn{background:#123466;border-color:#285ca7}
+.toolbar{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:12px}
+.toolbtn{border:1px solid #213c59;border-radius:12px;padding:9px 6px;background:#0d1d31;color:#dcecff;font-size:11px;font-weight:800}
+.pop{position:fixed;inset:0;background:rgba(2,7,13,.8);z-index:50;display:none;align-items:center;justify-content:center;padding:18px}
+.pop.on{display:flex}.popbox{width:min(520px,100%);max-height:82vh;overflow:auto;background:#0a192b;border:1px solid #29435f;border-radius:18px;padding:15px}
+.popbox h3{margin:0 0 10px}.input{width:100%;border:1px solid #29435f;background:#071321;color:#fff;border-radius:11px;padding:11px;margin:5px 0 10px}
+.toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);z-index:80;background:#172b43;border:1px solid #34516f;color:#fff;padding:10px 14px;border-radius:999px;display:none;font-size:12px}
+.toast.on{display:block}
+
+@media(max-width:560px){.metrics{grid-template-columns:repeat(2,1fr)}.detail-grid{grid-template-columns:repeat(3,1fr)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <div><div class="brand">🤖 명하 VIP LIVE</div><div class="sub" id="stamp">Telegram 연결 확인 중...</div></div>
+    <div class="live" id="ws">WS -</div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><small>시장 위험</small><strong id="risk">-</strong></div>
+    <div class="kpi"><small>VIP</small><strong id="vipCount">-</strong></div>
+    <div class="kpi"><small>보유</small><strong id="holdCount">-</strong></div>
+  </div>
+
+  <div class="toolbar">
+    <button class="toolbtn" onclick="addVip()">➕ VIP 추가</button>
+    <button class="toolbtn" onclick="showBrief('morning')">🌅 아침</button>
+    <button class="toolbtn" onclick="showBrief('close')">🌙 마감</button>
+    <button class="toolbtn" onclick="showBrief('nxt')">NXT 마감</button>
+    <button class="toolbtn" onclick="showBrief('weekly')">📈 주간</button>
+    <button class="toolbtn" onclick="showDiag()">🩺 진단</button>
+    <button class="toolbtn" onclick="showNextdayStats()">🧪 예측성적</button>
+  </div>
+
+  <div class="tabs">
+    <button class="tab on" data-tab="all">전체</button>
+    <button class="tab" data-tab="signal">🟢 타점</button>
+    <button class="tab" data-tab="watch">🟡 관찰</button>
+    <button class="tab" data-tab="hold">💼 보유</button>
+    <button class="tab" data-tab="history">📋 기록</button>
+  </div>
+  <section id="list"></section>
+</div>
+
+<div class="bottom">
+  <div class="bottomin">
+    <button class="btn primary" onclick="loadState()">🔄 새로고침</button>
+    <button class="btn" onclick="tg?.close()">✕ 닫기</button>
+  </div>
+</div>
+
+<div class="modal" id="modal" onclick="if(event.target===this)closeDetail()">
+  <div class="sheet">
+    <div class="row"><div><h2 id="dName">종목</h2><div class="sub" id="dStage"></div></div><button class="close" onclick="closeDetail()">닫기</button></div>
+    <div class="detail-grid" id="dGrid"></div>
+    <div class="chartwrap"><canvas id="chart"></canvas></div>
+    <div class="section-title">현재 판단</div><div class="signal" id="dNote"></div>
+    <div class="actions">
+      <button class="action warnbtn" onclick="stockAction('observe')">🟡 추가관찰</button>
+      <button class="action badbtn" onclick="stockAction('pass')">❌ 파동 패스</button>
+      <button class="action goodbtn" onclick="buyManage()">💼 매수등록</button>
+      <button class="action bluebtn" onclick="sellManage()">✅ 매도종료</button>
+      <button class="action" onclick="showNews()">📰 종목뉴스</button>
+      <button class="action bluebtn" onclick="showNextday()">🧠 내일흐름 분석</button>
+      <button class="action badbtn" onclick="removeVip()">➖ VIP 삭제</button>
+    </div>
+  </div>
+</div>
+
+<div class="pop" id="pop" onclick="if(event.target===this)closePop()">
+  <div class="popbox">
+    <div class="row"><h3 id="popTitle">정보</h3><button class="close" onclick="closePop()">닫기</button></div>
+    <div id="popBody" class="note"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const tg=window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();try{tg.setHeaderColor('#07111f');tg.setBackgroundColor('#07111f')}catch(e){}}
+const initData=tg?.initData||'';
+let STATE=null,active='all',chart=null,currentCode=null;
+const $=id=>document.getElementById(id);
+const won=n=>Number(n||0).toLocaleString('ko-KR');
+const ago=s=>{if(!s)return '-';const d=(Date.now()-new Date(s).getTime())/1000;if(d<60)return Math.max(0,Math.round(d))+'초 전';if(d<3600)return Math.round(d/60)+'분 전';return Math.round(d/3600)+'시간 전'};
+const stageColor=s=>({BREAKOUT:'var(--cyan)',SIGNAL:'var(--green)',MOMENTUM:'var(--blue)',READY:'var(--orange)',PULLBACK:'var(--yellow)',HOLD:'var(--blue)',COOLDOWN:'var(--muted)',WAIT:'var(--muted)'})[s]||'var(--muted)';
+const authHeaders=()=>({'X-Telegram-Init-Data':initData});
+
+function vipCard(t){
+  const sc=Math.max(0,Math.min(100,Number(t.score||0)));
+  return `<div class="card" onclick="openDetail('${t.code}')">
+    <div class="row"><div><span class="name">${t.name}</span><span class="code">${t.code}</span></div><span class="status" style="color:${stageColor(t.stage)}">${t.stage_label}</span></div>
+    <div class="row"><div class="price">${won(t.price)}원</div><div class="sub">마지막체결 ${ago(t.last_tick_at)}</div></div>
+    <div class="metrics">
+      <div class="metric"><small>체결강도</small><b>${Number(t.strength||0).toFixed(0)}</b></div>
+      <div class="metric"><small>거래량비</small><b>${Number(t.volume_ratio||0).toFixed(2)}</b></div>
+      <div class="metric"><small>VWAP</small><b>${won(t.vwap)}</b></div>
+      <div class="metric"><small>지지 / 저항</small><b>${won(t.support)} / ${won(t.resistance)}</b></div>
+    </div>
+    <div class="scorebar"><i style="width:${sc}%"></i></div>
+    <div class="note">${t.note||'조건 대기'} · ${Math.round(sc)}점${t.orderbook_imbalance?` · 호가 ${Number(t.orderbook_imbalance).toFixed(2)}배`:''}${Number(t.projected_volume_ratio||0)>0?` · 예상1분 ${Number(t.projected_volume_ratio).toFixed(2)}배`:''}${t.daily_trend&&t.daily_trend!=='UNKNOWN'?` · ${t.daily_trend}`:''}</div>
+  </div>`;
+}
+
+function holdCard(h){
+  const np=Number(h.net_pnl||0), nr=Number(h.net_return_pct||0), qty=Number(h.qty||0);
+  const cls=np>=0?'good':'bad';
+  return `<div class="card" onclick="openDetail('${h.code}')">
+    <div class="row">
+      <div><span class="name">${h.name}</span><span class="code">${h.code}</span></div>
+      <b class="${cls}">${np>=0?'+':''}${Math.round(np).toLocaleString()}원</b>
+    </div>
+    <div class="metrics">
+      <div class="metric"><small>매수가</small><b>${won(h.entry)}</b></div>
+      <div class="metric"><small>현재가</small><b>${won(h.current)}</b></div>
+      <div class="metric"><small>수량</small><b>${qty.toLocaleString()}주</b></div>
+      <div class="metric"><small>수수료후 수익률</small><b class="${cls}">${nr>=0?'+':''}${nr.toFixed(2)}%</b></div>
+      <div class="metric"><small>매수금액</small><b>${Math.round(Number(h.buy_amount||0)).toLocaleString()}원</b></div>
+      <div class="metric"><small>평가금액</small><b>${Math.round(Number(h.market_value||0)).toLocaleString()}원</b></div>
+      <div class="metric"><small>예상비용</small><b>${Math.round(Number(h.estimated_cost||0)).toLocaleString()}원</b></div>
+      <div class="metric"><small>순손익</small><b class="${cls}">${np>=0?'+':''}${Math.round(np).toLocaleString()}원</b></div>
+      <div class="metric"><small>방어선</small><b>${won(h.stop)}</b></div>
+      <div class="metric"><small>관리단계</small><b>Lv.${h.level}</b></div>
+    </div>
+    <div class="note">나무증권 추정비용 · 매수수수료 ${Math.round(Number(h.buy_fee||0)).toLocaleString()}원 · 매도수수료 ${Math.round(Number(h.sell_fee||0)).toLocaleString()}원 · 매도세금 ${Math.round(Number(h.sell_tax||0)).toLocaleString()}원</div>
+  </div>`;
+}
+
+function historyView(){
+  let out='<div class="section-title">최근 신호</div>';
+  const sig=STATE?.signals||[];
+  out+=sig.length?sig.slice(0,10).map(s=>`<div class="signal">${s.signal_type==='BREAKOUT'?'🚀':'🟢'} <b>${s.name}</b> · ${won(s.price)}원<br><span class="sub">${s.time||''} · 체결강도 ${Number(s.strength||0).toFixed(0)} · 점수 ${Number(s.score||0).toFixed(0)}</span></div>`).join(''):'<div class="empty">최근 신호 없음</div>';
+  out+='<div class="section-title">최근 매매 기록</div>';
+  const tr=STATE?.trades||[];
+  out+=tr.length?tr.slice(0,10).map(x=>`<div class="signal">💼 <b>${x.name}</b> · <span class="${Number(x.return_pct)>=0?'good':'bad'}">${Number(x.return_pct)>=0?'+':''}${Number(x.return_pct).toFixed(2)}%</span><br><span class="sub">${x.closed_at||''} · ${x.reason||''}</span></div>`).join(''):'<div class="empty">매매 기록 없음</div>';
+  return out;
+}
+
+function render(){
+  if(!STATE)return;
+  $('risk').innerHTML=`<span class="${STATE.market.risk==='RISK'?'bad':STATE.market.risk==='CAUTION'?'warn':'good'}">${STATE.market.risk}</span>`;
+  $('vipCount').textContent=STATE.vip.length;
+  $('holdCount').textContent=STATE.holdings.length;
+  $('ws').textContent=`WS ${STATE.runtime.ws||'-'} · 체결 ${STATE.runtime.trade_subscribed||0}`;
+  $('stamp').textContent=`업데이트 ${new Date(STATE.server_time).toLocaleTimeString('ko-KR')}`;
+  if(active==='history'){$('list').innerHTML=historyView();return}
+  if(active==='hold'){$('list').innerHTML=STATE.holdings.length?STATE.holdings.map(holdCard).join(''):'<div class="empty">보유 종목 없음</div>';return}
+  let rows=STATE.vip;
+  if(active==='signal')rows=rows.filter(x=>['BREAKOUT','SIGNAL','MOMENTUM','READY'].includes(x.stage));
+  if(active==='watch')rows=rows.filter(x=>x.stage==='PULLBACK');
+  $('list').innerHTML=rows.length?rows.map(vipCard).join(''):'<div class="empty">현재 해당 종목 없음</div>';
+}
+
+async function loadState(){
+  try{
+    const r=await fetch('/api/miniapp/state',{headers:authHeaders(),cache:'no-store'});
+    if(r.status===401){$('stamp').textContent='Telegram 안에서 Mini App을 열어주세요';return}
+    STATE=await r.json();render();
+  }catch(e){$('stamp').textContent='서버 연결 실패'}
+}
+
+async function openDetail(code){
+  currentCode=code;
+  try{
+    const r=await fetch('/api/miniapp/stock/'+code,{headers:authHeaders(),cache:'no-store'});
+    if(!r.ok)return;
+    const d=await r.json(),s=d.state||{};
+    $('dName').textContent=d.name+' · '+d.code;
+    $('dStage').textContent=s.stage_label||'';
+    $('dGrid').innerHTML=[
+      ['현재가',won(s.price)+'원'],['체결강도',Number(s.strength||0).toFixed(0)],['거래량비',Number(s.volume_ratio||0).toFixed(2)],
+      ['VWAP',won(s.vwap)],['지지',won(s.support)],['저항',won(s.resistance)],
+      ['타점점수',Number(s.score||0).toFixed(0)+' ('+(s.grade||'C')+')'],['눌림',Number(s.pullback_pct||0).toFixed(2)+'%'],['호가',d.orderbook?Number(d.orderbook.imbalance).toFixed(2)+'배':'-'],
+      ['예상1분',Number(s.projected_volume_ratio||0).toFixed(2)+'배'],['일봉 MA5',won(s.ma5d)],['일봉 MA20',won(s.ma20d)]
+    ].map(x=>`<div class="detailbox"><small>${x[0]}</small><b>${x[1]}</b></div>`).join('');
+    let note=s.note||'조건 대기';
+    if(d.position){
+      const p=d.position, np=Number(p.net_pnl||0), nr=Number(p.net_return_pct||0);
+      note += `\n\n💼 ${Number(p.qty||0).toLocaleString()}주 · 매수가 ${won(p.entry)} · 순손익 ${np>=0?'+':''}${Math.round(np).toLocaleString()}원 (${nr>=0?'+':''}${nr.toFixed(2)}%) · 예상비용 ${Math.round(Number(p.estimated_cost||0)).toLocaleString()}원`;
+    }
+    $('dNote').textContent=note;
+    $('modal').classList.add('on');
+    const labels=d.bars.map(b=>new Date(b.time).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit',hour12:false}));
+    const prices=d.bars.map(b=>b.close);
+    if(chart)chart.destroy();
+    chart=new Chart($('chart'),{
+      type:'line',
+      data:{labels,datasets:[
+        {label:'현재가',data:prices,borderColor:'#47dad7',borderWidth:2,pointRadius:0,tension:.2},
+        {label:'VWAP',data:prices.map(()=>s.vwap||null),borderColor:'#ffd65a',borderWidth:1,pointRadius:0,borderDash:[5,5]},
+        {label:'지지',data:prices.map(()=>s.support||null),borderColor:'#2bd27f',borderWidth:1,pointRadius:0,borderDash:[3,4]},
+        {label:'저항',data:prices.map(()=>s.resistance||null),borderColor:'#ff6272',borderWidth:1,pointRadius:0,borderDash:[3,4]}
+      ]},
+      options:{responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{labels:{color:'#9db4c9',boxWidth:10}}},scales:{x:{ticks:{color:'#7890a7',maxTicksLimit:6},grid:{color:'#10243a'}},y:{ticks:{color:'#7890a7'},grid:{color:'#10243a'}}}}
+    });
+  }catch(e){}
+}
+
+function toast(msg){
+  const el=$('toast');el.textContent=msg;el.classList.add('on');
+  setTimeout(()=>el.classList.remove('on'),2200);
+}
+function showPop(title,htmlText){
+  $('popTitle').textContent=title;
+  $('popBody').innerHTML=htmlText;
+  $('pop').classList.add('on');
+}
+function closePop(){$('pop').classList.remove('on')}
+async function apiPost(url,data={}){
+  const r=await fetch(url,{
+    method:'POST',
+    headers:{...authHeaders(),'Content-Type':'application/json'},
+    body:JSON.stringify(data),
+    cache:'no-store'
+  });
+  let j={};try{j=await r.json()}catch(e){}
+  if(!r.ok)throw new Error(j.message||j.error||('HTTP '+r.status));
+  return j;
+}
+async function stockAction(action){
+  if(!currentCode)return;
+  try{
+    const j=await apiPost(`/api/miniapp/stock/${currentCode}/${action}`);
+    toast(j.message||'처리 완료');await loadState();await openDetail(currentCode);
+  }catch(e){toast('실패: '+e.message)}
+}
+async function buyManage(){
+  if(!currentCode)return;
+  const t=STATE?.vip?.find(x=>x.code===currentCode);
+  const p=prompt('관리 시작 매수가를 입력하세요. 실제 주문은 발생하지 않습니다.',Math.round(Number(t?.price||0)));
+  if(p===null)return;
+  const q=prompt('수량을 입력하세요.','1');if(q===null)return;
+  try{
+    const j=await apiPost(`/api/miniapp/stock/${currentCode}/buy`,{price:Number(p),qty:Number(q)});
+    toast(j.message||'매수등록 완료');closeDetail();await loadState();
+  }catch(e){toast('실패: '+e.message)}
+}
+async function sellManage(){
+  if(!currentCode)return;
+  const t=STATE?.vip?.find(x=>x.code===currentCode);
+  const p=prompt('관리 종료 가격을 입력하세요. 실제 주문은 발생하지 않습니다.',Math.round(Number(t?.price||0)));
+  if(p===null)return;
+  if(!confirm('보유관리를 종료할까요?\n실제 증권사 매도 주문은 발생하지 않습니다.'))return;
+  try{
+    const j=await apiPost(`/api/miniapp/stock/${currentCode}/sell`,{price:Number(p)});
+    toast(j.message||'매도종료 완료');closeDetail();await loadState();
+  }catch(e){toast('실패: '+e.message)}
+}
+async function addVip(){
+  const q=prompt('추가할 종목명 또는 6자리 종목코드를 입력하세요.');
+  if(!q)return;
+  try{
+    const j=await apiPost('/api/miniapp/vip/add',{query:q});
+    toast(`${j.name||q} VIP 추가 완료`);await loadState();
+  }catch(e){toast('실패: '+e.message)}
+}
+async function removeVip(){
+  if(!currentCode)return;
+  const t=STATE?.vip?.find(x=>x.code===currentCode);
+  if(!confirm(`${t?.name||currentCode} 종목을 VIP에서 삭제할까요?`))return;
+  try{
+    const j=await apiPost(`/api/miniapp/vip/${currentCode}/remove`);
+    toast(j.message||'VIP 삭제 완료');closeDetail();await loadState();
+  }catch(e){toast('실패: '+e.message)}
+}
+async function showNextday(){
+  if(!currentCode)return;
+  try{
+    toast('내일흐름 분석 중...');
+    const j=await apiPost(`/api/miniapp/stock/${currentCode}/nextday`,{});
+    const a=j.analysis||{}, sc=a.scenarios||[], reasons=a.reasons||[], cautions=a.cautions||[];
+    const z=(x)=>Array.isArray(x)&&x.length===2?`${won(x[0])}~${won(x[1])}원`:'-';
+    let body=`
+      <div class="signal">
+        <b>기본 판단</b><br>${escapeHtml(a.primary_view||'-')}<br>
+        <span class="sub">셋업 ${Number(a.setup_score||0).toFixed(0)}점 · 추격위험 ${Number(a.chase_risk||0).toFixed(0)}점 · 데이터 ${escapeHtml(a.data_quality||'-')}</span>
+      </div>
+      <div class="detail-grid">
+        <div class="detailbox"><small>관심 진입</small><b>${z(a.preferred_entry_zone)}</b></div>
+        <div class="detailbox"><small>핵심 지지</small><b>${z(a.support_zone)}</b></div>
+        <div class="detailbox"><small>1차 저항</small><b>${z(a.resistance_zone)}</b></div>
+        <div class="detailbox"><small>무효 가격</small><b>${won(a.invalidation_price)}원</b></div>
+        <div class="detailbox"><small>캔들</small><b>${Number(a.candle_score||0).toFixed(0)}</b></div>
+        <div class="detailbox"><small>거래량</small><b>${Number(a.volume_score||0).toFixed(0)}</b></div>
+      </div>`;
+    if(reasons.length){
+      body+=`<div class="section-title">판단 근거</div>`+
+        reasons.map(x=>`<div class="signal">• ${escapeHtml(x)}</div>`).join('');
+    }
+    if(cautions.length){
+      body+=`<div class="section-title">주의</div>`+
+        cautions.map(x=>`<div class="signal warn">• ${escapeHtml(x)}</div>`).join('');
+    }
+    if(sc.length){
+      body+=`<div class="section-title">다음 거래일 시나리오</div>`+
+        sc.map(x=>`<div class="signal"><b>${escapeHtml(x.name||'')}</b> · 상대점수 ${Number(x.relative_score||0).toFixed(1)}<br>${escapeHtml(x.condition||'')}<br><span class="sub">${escapeHtml(x.action||'')}</span></div>`).join('');
+    }
+    const ai=j.ai||{};
+    if(ai.ok&&ai.analysis){
+      const x=ai.analysis;
+      body+=`<div class="section-title">🤖 Gemini 보조 해석</div>
+        <div class="signal"><b>${escapeHtml(x.verdict||'')}</b><br>${escapeHtml(x.expert_summary||'')}</div>
+        <div class="signal"><b>상승 시나리오</b><br>${escapeHtml(x.bullish_case||'')}</div>
+        <div class="signal"><b>횡보 시나리오</b><br>${escapeHtml(x.neutral_case||'')}</div>
+        <div class="signal"><b>하락 시나리오</b><br>${escapeHtml(x.bearish_case||'')}</div>
+        <div class="signal"><b>진입 해석</b><br>${escapeHtml(x.entry_comment||'')}<br><br><b>무효조건</b><br>${escapeHtml(x.invalidation_comment||'')}</div>
+        ${(x.risk_flags||[]).length?`<div class="signal warn"><b>위험요인</b><br>${(x.risk_flags||[]).map(y=>'• '+escapeHtml(y)).join('<br>')}</div>`:''}
+        <div class="signal"><b>최종 대응</b><br>${escapeHtml(x.final_action||'')}</div>
+        <div class="note">AI 모델: ${escapeHtml(ai.model||'Gemini')} · AI는 보조 해석이며 규칙 엔진의 실제 가격대를 변경하지 않습니다.</div>`;
+    }else{
+      body+=`<div class="section-title">🤖 Gemini 보조 해석</div>
+        <div class="signal warn">${escapeHtml(ai.message||'Gemini가 연결되지 않아 규칙 엔진 결과만 표시합니다.')}</div>`;
+    }
+    body+=`<div class="note">※ 상대점수는 백테스트된 확률이 아닙니다. 다음 거래일 결과를 자동 채점해 표본을 쌓습니다.</div>`;
+    showPop('🧠 내일흐름 분석',body);
+  }catch(e){
+    toast('분석 실패: '+e.message);
+  }
+}
+
+async function showNews(){
+  if(!currentCode)return;
+  try{
+    const r=await fetch(`/api/miniapp/stock/${currentCode}/news`,{headers:authHeaders(),cache:'no-store'});
+    const j=await r.json();if(!r.ok)throw new Error(j.error||'뉴스 조회 실패');
+    const rows=j.news||[];
+    showPop(`📰 ${j.name} 뉴스`,rows.length?rows.map(x=>{const title=escapeHtml(x.title||'');const tm=escapeHtml(x.time_text||'');const link=escapeHtml(x.link||'');return `<div class="signal"><b>${link?`<a href="${link}" target="_blank" rel="noopener noreferrer">${title}</a>`:title}</b><br><span class="sub">${tm}</span></div>`}).join(''):'<div class="empty">최근 뉴스 없음</div>');
+  }catch(e){toast('실패: '+e.message)}
+}
+async function showBrief(kind){
+  try{
+    const r=await fetch(`/api/miniapp/brief/${kind}`,{headers:authHeaders(),cache:'no-store'});
+    const j=await r.json();if(!r.ok)throw new Error(j.error||'브리핑 실패');
+    showPop(j.title||'브리핑',`<div class="signal" style="white-space:pre-wrap">${escapeHtml(j.text||'')}</div>`);
+  }catch(e){toast('실패: '+e.message)}
+}
+async function showNextdayStats(){
+  try{
+    const r=await fetch('/api/miniapp/nextday/stats',{headers:authHeaders(),cache:'no-store'});
+    const j=await r.json();if(!r.ok)throw new Error(j.error||'성적 조회 실패');
+    const s=j.stats||{}, rows=s.recent||[];
+    let body='';
+    if(!Number(s.count||0)){
+      body='<div class="empty">아직 다음 거래일 채점이 완료된 예측이 없습니다.</div>';
+    }else{
+      body=`<div class="detail-grid">
+        <div class="detailbox"><small>채점건수</small><b>${Number(s.count||0)}</b></div>
+        <div class="detailbox"><small>성공률</small><b>${Number(s.success_rate||0).toFixed(1)}%</b></div>
+        <div class="detailbox"><small>평균채점</small><b>${Number(s.avg_score||0).toFixed(1)}</b></div>
+      </div>
+      <div class="note">※ 현재 성공률은 규칙 엔진의 초기 실전 기록입니다. 충분한 표본 전에는 확률로 해석하지 않습니다.</div>`;
+      body+=rows.map(x=>`<div class="signal">
+        ${x.success?'✅':'❌'} <b>${escapeHtml(x.name||x.code||'')}</b> · ${escapeHtml(x.primary_view||'')}<br>
+        <span class="sub">${escapeHtml(x.asof||'')} → ${escapeHtml(x.target_date||'')} · 채점 ${Number(x.score||0)}점 · 종가 ${Number(x.close_return_pct||0)>=0?'+':''}${Number(x.close_return_pct||0).toFixed(2)}% · 최대 ${Number(x.max_up_pct||0)>=0?'+':''}${Number(x.max_up_pct||0).toFixed(2)}% / ${Number(x.max_down_pct||0).toFixed(2)}%</span>
+        ${x.resistance_reached?'<br><span class="good">저항 도달</span>':''}
+        ${x.invalidated?'<br><span class="bad">무효가격 이탈</span>':''}
+        ${x.ambiguous_intraday_order?'<br><span class="warn">일봉상 고가/저가 순서 불명</span>':''}
+      </div>`).join('');
+    }
+    showPop('🧪 내일흐름 예측성적',body);
+  }catch(e){toast('실패: '+e.message)}
+}
+
+async function showDiag(){
+  try{
+    const r=await fetch('/api/miniapp/diag',{headers:authHeaders(),cache:'no-store'});
+    const j=await r.json();if(!r.ok)throw new Error(j.error||'진단 실패');
+    showPop('🩺 시스템 진단',`<div class="signal" style="white-space:pre-wrap">${escapeHtml(j.text||'')}</div>`);
+  }catch(e){toast('실패: '+e.message)}
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
+
+function closeDetail(){$('modal').classList.remove('on')}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));b.classList.add('on');active=b.dataset.tab;render()});
+loadState();setInterval(loadState,3000);
+</script>
+</body>
+</html>
